@@ -7,8 +7,9 @@ continuation prompt back into the same session and keeps working until the
 goal is done, turn budget is exhausted, the user pauses/clears it, or the
 user sends a new message (which takes priority and pauses the goal loop).
 
-State is persisted in SessionDB's ``state_meta`` table keyed by
-``goal:<session_id>`` so ``/resume`` picks it up.
+Compatibility state remains keyed by ``goal:<session_id>`` for ``/resume``.
+New goals also own a version-fenced coordinator row that survives session and
+PTY lifecycle changes independently.
 
 Design notes / invariants:
 
@@ -31,7 +32,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -452,10 +455,18 @@ class GoalState:
     checkpoint_budget_used: Optional[int] = None
     checkpoint_budget_max: Optional[int] = None
     checkpoint_summary: Optional[str] = None
+    coordinator_id: Optional[str] = None
+    coordinator_version: int = 0
 
     def to_json(self) -> str:
         data = asdict(self)
         # asdict already recursed GoalContract into a plain dict.
+        return json.dumps(data, ensure_ascii=False)
+
+    def to_persistence_json(self) -> str:
+        """Serialize bounded control state without model-generated prose."""
+        data = asdict(self)
+        data["last_reason"] = None
         return json.dumps(data, ensure_ascii=False)
 
     @classmethod
@@ -490,6 +501,8 @@ class GoalState:
             checkpoint_budget_used=(int(data["checkpoint_budget_used"]) if data.get("checkpoint_budget_used") is not None else None),
             checkpoint_budget_max=(int(data["checkpoint_budget_max"]) if data.get("checkpoint_budget_max") is not None else None),
             checkpoint_summary=(str(data["checkpoint_summary"]) if data.get("checkpoint_summary") else None),
+            coordinator_id=(str(data["coordinator_id"]) if data.get("coordinator_id") else None),
+            coordinator_version=int(data.get("coordinator_version", 0) or 0),
         )
 
     # --- contract helpers -------------------------------------------------
@@ -532,7 +545,8 @@ def _get_session_db() -> Optional[Any]:
         from hermes_constants import get_hermes_home
         from hermes_state import SessionDB
 
-        home = str(get_hermes_home())
+        home_path = get_hermes_home()
+        home = str(home_path)
     except Exception as exc:  # pragma: no cover
         logger.debug("GoalManager: SessionDB bootstrap failed (%s)", exc)
         return None
@@ -541,7 +555,10 @@ def _get_session_db() -> Optional[Any]:
     if cached is not None:
         return cached
     try:
-        db = SessionDB()
+        # Pass the resolved profile path explicitly. ``hermes_state`` may have
+        # been imported before a profile/test HERMES_HOME switch, so its
+        # module-level DEFAULT_DB_PATH can point at a different profile.
+        db = SessionDB(db_path=home_path / "state.db")
     except Exception as exc:  # pragma: no cover
         logger.debug("GoalManager: SessionDB() raised (%s)", exc)
         return None
@@ -570,17 +587,182 @@ def load_goal(session_id: str) -> Optional[GoalState]:
         return None
 
 
+def _coordinator_status(state: GoalState) -> str:
+    return {
+        "active": "running",
+        "paused": "yielded",
+        "needs_continuation": "needs_continuation",
+        "done": "completed",
+        "cleared": "cancelled",
+    }.get(state.status, "running")
+
+
+def _coordinator_checkpoint(state: GoalState) -> Optional[Dict[str, Any]]:
+    if not state.checkpoint_id:
+        return None
+    repository, changed_files = _repository_checkpoint_state()
+    return {
+        "checkpoint_id": state.checkpoint_id,
+        "reason": state.checkpoint_reason,
+        "budget": {
+            "used": state.checkpoint_budget_used,
+            "maximum": state.checkpoint_budget_max,
+        },
+        "milestone": {
+            "id": state.checkpoint_id,
+            "title": "Model iteration handoff",
+            "sequence": state.coordinator_version,
+        },
+        "repository": repository,
+        "files_changed": changed_files,
+        "validation": [],
+        "child_sessions": (
+            [
+                {
+                    "id": state.waiting_on_session,
+                    "status": "active",
+                    "summary": state.waiting_reason or "Goal is waiting on child session.",
+                }
+            ]
+            if state.waiting_on_session
+            else []
+        ),
+        "blockers": [state.waiting_reason] if state.waiting_reason else [],
+        "approvals_needed": [],
+        "artifacts": [],
+        "next_action": "Resume the goal in a fresh bounded model slice.",
+        "continuation_summary": state.checkpoint_summary,
+    }
+
+
+def _repository_checkpoint_state() -> Tuple[Dict[str, Any], List[str]]:
+    """Collect bounded git/worktree metadata without shell interpolation."""
+    cwd = os.getcwd()
+
+    def _git(*args: str) -> str:
+        try:
+            return subprocess.run(
+                ["git", *args],
+                cwd=cwd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    root = _git("rev-parse", "--show-toplevel")
+    branch = _git("branch", "--show-current")
+    head_sha = _git("rev-parse", "HEAD")
+    porcelain = _git("status", "--porcelain=v1")
+    ahead = behind = None
+    upstream_counts = _git(
+        "rev-list", "--left-right", "--count", "HEAD...@{upstream}"
+    ).split()
+    if len(upstream_counts) == 2 and all(value.isdigit() for value in upstream_counts):
+        ahead, behind = (int(value) for value in upstream_counts)
+    changed_files = []
+    for line in porcelain.splitlines():
+        path = line[3:] if len(line) > 3 else ""
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        if path:
+            changed_files.append(path[:1024])
+    return (
+        {
+            "root": root or None,
+            "worktree": cwd,
+            "branch": branch or None,
+            "head_sha": head_sha or None,
+            "ahead": ahead,
+            "behind": behind,
+            "dirty": bool(porcelain),
+        },
+        changed_files[:200],
+    )
+
+
+def _active_profile_name() -> str:
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
+def _create_coordinator_for_state(
+    db: Any,
+    session_id: str,
+    state: GoalState,
+    *,
+    supersede: Optional[GoalState] = None,
+    activate_status: Optional[str] = None,
+) -> bool:
+    previous_id = state.coordinator_id
+    previous_version = state.coordinator_version
+    state.coordinator_id = f"goal-{uuid.uuid4().hex}"
+    state.coordinator_version = 2
+    try:
+        db.create_goal_coordinator(
+            goal_id=state.coordinator_id,
+            profile_name=_active_profile_name(),
+            goal=state.goal,
+            acceptance_contract=state.contract.to_dict(),
+            session_id=session_id,
+            activate_status=activate_status or _coordinator_status(state),
+            legacy_meta_key=_meta_key(session_id),
+            legacy_state_json=state.to_persistence_json(),
+            supersede_goal_id=(supersede.coordinator_id if supersede else None),
+            supersede_expected_version=(
+                supersede.coordinator_version if supersede else None
+            ),
+        )
+    except Exception:
+        state.coordinator_id = previous_id
+        state.coordinator_version = previous_version
+        return False
+    return True
+
+
 def save_goal(session_id: str, state: GoalState) -> bool:
-    """Persist a goal to SessionDB and report whether the write succeeded."""
+    """Persist legacy state and its coordinator update atomically when linked."""
     if not session_id:
         return False
     db = _get_session_db()
     if db is None:
         return False
     try:
-        db.set_meta(_meta_key(session_id), state.to_json())
+        if state.coordinator_id and state.coordinator_version > 0:
+            previous_version = state.coordinator_version
+            state.coordinator_version = previous_version + 1
+            try:
+                db.transition_goal_coordinator(
+                    state.coordinator_id,
+                    expected_version=previous_version,
+                    new_status=_coordinator_status(state),
+                    reason=(
+                        state.checkpoint_reason
+                        or state.paused_reason
+                        or f"goal-state:{state.status}"
+                    ),
+                    checkpoint=_coordinator_checkpoint(state),
+                    acceptance_contract=state.contract.to_dict(),
+                    session_id=session_id,
+                    legacy_meta_key=_meta_key(session_id),
+                    legacy_state_json=state.to_persistence_json(),
+                    clear_resume_metadata=(
+                        state.status == "active" and state.checkpoint_id is None
+                    ),
+                )
+            except Exception:
+                state.coordinator_version = previous_version
+                raise
+        else:
+            return _create_coordinator_for_state(db, session_id, state)
     except Exception as exc:
-        logger.debug("GoalManager: set_meta failed: %s", exc)
+        logger.debug("GoalManager: persistence failed: %s", exc)
         return False
     return True
 
@@ -635,6 +817,30 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         # lineage that re-established its own goal).
         if load_goal(new_session_id) is not None:
             return False
+        if state.coordinator_id and state.coordinator_version > 0:
+            db = _get_session_db()
+            if db is None:
+                return False
+            candidate = GoalState.from_json(state.to_json())
+            candidate.coordinator_version += 1
+            cleared = GoalState.from_json(state.to_json())
+            cleared.status = "cleared"
+            db.transition_goal_coordinator(
+                state.coordinator_id,
+                expected_version=state.coordinator_version,
+                new_status=_coordinator_status(state),
+                reason=reason or "session-rotation",
+                session_id=new_session_id,
+                legacy_meta_key=_meta_key(new_session_id),
+                legacy_state_json=candidate.to_persistence_json(),
+                legacy_clear_meta_key=_meta_key(old_session_id),
+                legacy_clear_state_json=cleared.to_persistence_json(),
+            )
+            logger.debug(
+                "GoalManager: migrated durable goal %s -> %s (%s)",
+                old_session_id, new_session_id, reason or "rotation",
+            )
+            return True
         if not save_goal(new_session_id, state):
             return False
         # Archive the parent's row so it isn't double-counted as active.
@@ -1131,8 +1337,51 @@ class GoalManager:
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
+        self._db = _get_session_db()
         self._state: Optional[GoalState] = load_goal(session_id)
-
+        if (
+            self._db is not None
+            and self._state is not None
+            and not self._state.coordinator_id
+            and self._state.status in {"active", "paused", "needs_continuation"}
+        ):
+            session = self._db.get_session(self.session_id)
+            migrate_as_orphaned = (
+                session is None or session.get("ended_at") is not None
+            )
+            if not _create_coordinator_for_state(
+                self._db,
+                self.session_id,
+                self._state,
+                activate_status="orphaned" if migrate_as_orphaned else None,
+            ):
+                logger.warning(
+                    "GoalManager: legacy goal migration failed for %s; "
+                    "the existing state_meta record was preserved",
+                    self.session_id,
+                )
+            elif migrate_as_orphaned:
+                self._state = None
+        elif self._db is not None and self._state and self._state.coordinator_id:
+            coordinator = self._db.get_goal_coordinator(self._state.coordinator_id)
+            if coordinator and coordinator["status"] == "orphaned":
+                session = self._db.get_session(self.session_id)
+                if session is not None and session.get("ended_at") is None:
+                    # Session resume explicitly reopened the original binding.
+                    candidate = GoalState.from_json(self._state.to_json())
+                    candidate.coordinator_version = coordinator["version"]
+                    if save_goal(self.session_id, candidate):
+                        self._state = candidate
+                    else:
+                        logger.warning(
+                            "GoalManager: failed to reclaim coordinator %s for reopened session",
+                            candidate.coordinator_id,
+                        )
+                        self._state = None
+                else:
+                    # Deleted/ended sessions are no longer authoritative.
+                    # Recovery must use explicit durable discovery/binding.
+                    self._state = None
     # --- introspection ------------------------------------------------
 
     @property
@@ -1195,8 +1444,22 @@ class GoalManager:
             last_turn_at=0.0,
             contract=contract if contract is not None else GoalContract(),
         )
+        if self._db is None:
+            raise RuntimeError("could not open durable goal coordinator store")
+        if not _create_coordinator_for_state(
+            self._db,
+            self.session_id,
+            state,
+            supersede=(
+                self._state
+                if self._state
+                and self._state.coordinator_id
+                and self._state.status in {"active", "paused", "needs_continuation"}
+                else None
+            ),
+        ):
+            raise RuntimeError("could not persist durable goal coordinator")
         self._state = state
-        save_goal(self.session_id, state)
         return state
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
@@ -1206,23 +1469,29 @@ class GoalManager:
         """
         if self._state is None:
             return None
-        self._state.contract = contract or GoalContract()
-        save_goal(self.session_id, self._state)
-        return self._state
+        candidate = GoalState.from_json(self._state.to_json())
+        candidate.contract = contract or GoalContract()
+        if not save_goal(self.session_id, candidate):
+            raise RuntimeError("could not persist goal contract")
+        self._state = candidate
+        return candidate
 
     def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
         if not self._state:
             return None
-        self._state.status = "paused"
-        self._state.paused_reason = reason
+        candidate = GoalState.from_json(self._state.to_json())
+        candidate.status = "paused"
+        candidate.paused_reason = reason
         # A wait barrier is meaningless once paused — drop it.
-        self._state.waiting_on_pid = None
-        self._state.waiting_on_session = None
-        self._state.waiting_until = 0.0
-        self._state.waiting_reason = None
-        self._state.waiting_since = 0.0
-        save_goal(self.session_id, self._state)
-        return self._state
+        candidate.waiting_on_pid = None
+        candidate.waiting_on_session = None
+        candidate.waiting_until = 0.0
+        candidate.waiting_reason = None
+        candidate.waiting_since = 0.0
+        if not save_goal(self.session_id, candidate):
+            raise RuntimeError("could not persist paused goal")
+        self._state = candidate
+        return candidate
 
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
         if not self._state:
@@ -1248,6 +1517,64 @@ class GoalManager:
             raise RuntimeError("could not persist resumed goal")
         self._state = candidate
         return self._state
+
+    def resume_durable(self, coordinator_id: str) -> GoalState:
+        """Atomically bind an orphaned/yielded coordinator to this session."""
+        if self._db is None:
+            raise RuntimeError("could not open durable goal coordinator store")
+        if self.has_goal():
+            raise RuntimeError(
+                "target session already has an active goal; clear or finish it first"
+            )
+        record = self._db.get_goal_coordinator(str(coordinator_id or "").strip())
+        if record is None:
+            raise RuntimeError("durable goal coordinator not found")
+        if record["status"] not in {"orphaned", "yielded", "needs_continuation"}:
+            raise RuntimeError(
+                f"durable goal coordinator is not resumable: {record['status']}"
+            )
+        old_session_id = str(record.get("session_id") or "")
+        if old_session_id and old_session_id != self.session_id:
+            old_session = self._db.get_session(old_session_id)
+            if old_session is not None and old_session.get("ended_at") is None:
+                raise RuntimeError(
+                    "durable goal coordinator original session is still live"
+                )
+        candidate = GoalState(
+            goal=record["goal"],
+            status="active",
+            created_at=record["created_at"],
+            contract=GoalContract.from_dict(record["acceptance_contract"]),
+            coordinator_id=record["id"],
+            coordinator_version=record["version"] + 1,
+        )
+        old_cleared_json = None
+        old_meta_key = None
+        if old_session_id and old_session_id != self.session_id:
+            old_state = load_goal(old_session_id)
+            if old_state is not None:
+                old_state.status = "cleared"
+                old_state.coordinator_version = record["version"]
+                old_meta_key = _meta_key(old_session_id)
+                old_cleared_json = old_state.to_persistence_json()
+        try:
+            self._db.transition_goal_coordinator(
+                record["id"],
+                expected_version=record["version"],
+                new_status="running",
+                reason="durable-resume",
+                acceptance_contract=candidate.contract.to_dict(),
+                session_id=self.session_id,
+                legacy_meta_key=_meta_key(self.session_id),
+                legacy_state_json=candidate.to_persistence_json(),
+                legacy_clear_meta_key=old_meta_key,
+                legacy_clear_state_json=old_cleared_json,
+                clear_resume_metadata=True,
+            )
+        except Exception as exc:
+            raise RuntimeError("could not bind durable goal coordinator") from exc
+        self._state = candidate
+        return candidate
 
     def checkpoint_after_max_iterations(self, turn_exit_reason: str) -> Dict[str, Any]:
         """Persist a compact, transcript-free handoff for a capped model turn.
@@ -1299,17 +1626,22 @@ class GoalManager:
     def clear(self) -> None:
         if self._state is None:
             return
-        self._state.status = "cleared"
-        save_goal(self.session_id, self._state)
+        candidate = GoalState.from_json(self._state.to_json())
+        candidate.status = "cleared"
+        if not save_goal(self.session_id, candidate):
+            raise RuntimeError("could not persist cleared goal")
         self._state = None
 
     def mark_done(self, reason: str) -> None:
         if not self._state:
             return
-        self._state.status = "done"
-        self._state.last_verdict = "done"
-        self._state.last_reason = reason
-        save_goal(self.session_id, self._state)
+        candidate = GoalState.from_json(self._state.to_json())
+        candidate.status = "done"
+        candidate.last_verdict = "done"
+        candidate.last_reason = reason
+        if not save_goal(self.session_id, candidate):
+            raise RuntimeError("could not persist completed goal")
+        self._state = candidate
 
     # --- /subgoal user controls ---------------------------------------
 
@@ -1324,8 +1656,11 @@ class GoalManager:
         text = (text or "").strip()
         if not text:
             raise ValueError("subgoal text is empty")
-        self._state.subgoals.append(text)
-        save_goal(self.session_id, self._state)
+        candidate = GoalState.from_json(self._state.to_json())
+        candidate.subgoals.append(text)
+        if not save_goal(self.session_id, candidate):
+            raise RuntimeError("could not persist added subgoal")
+        self._state = candidate
         return text
 
     def remove_subgoal(self, index_1based: int) -> str:
@@ -1337,8 +1672,11 @@ class GoalManager:
             raise IndexError(
                 f"index out of range (1..{len(self._state.subgoals)})"
             )
-        removed = self._state.subgoals.pop(idx)
-        save_goal(self.session_id, self._state)
+        candidate = GoalState.from_json(self._state.to_json())
+        removed = candidate.subgoals.pop(idx)
+        if not save_goal(self.session_id, candidate):
+            raise RuntimeError("could not persist removed subgoal")
+        self._state = candidate
         return removed
 
     def clear_subgoals(self) -> int:
@@ -1346,8 +1684,11 @@ class GoalManager:
         if self._state is None or not self.has_goal():
             raise RuntimeError("no active goal")
         prev = len(self._state.subgoals)
-        self._state.subgoals = []
-        save_goal(self.session_id, self._state)
+        candidate = GoalState.from_json(self._state.to_json())
+        candidate.subgoals = []
+        if not save_goal(self.session_id, candidate):
+            raise RuntimeError("could not persist cleared subgoals")
+        self._state = candidate
         return prev
 
     def render_subgoals(self) -> str:
@@ -1376,13 +1717,16 @@ class GoalManager:
         pid = int(pid)
         if pid <= 0:
             raise ValueError("pid must be a positive integer")
-        self._state.waiting_on_pid = pid
-        self._state.waiting_on_session = None
-        self._state.waiting_until = 0.0
-        self._state.waiting_reason = (reason or "").strip() or None
-        self._state.waiting_since = time.time()
-        save_goal(self.session_id, self._state)
-        return self._state
+        candidate = GoalState.from_json(self._state.to_json())
+        candidate.waiting_on_pid = pid
+        candidate.waiting_on_session = None
+        candidate.waiting_until = 0.0
+        candidate.waiting_reason = (reason or "").strip() or None
+        candidate.waiting_since = time.time()
+        if not save_goal(self.session_id, candidate):
+            raise RuntimeError("could not persist process wait")
+        self._state = candidate
+        return candidate
 
     def wait_on_session(self, session_id: str, reason: str = "") -> GoalState:
         """Park the goal loop on a process_registry session's OWN trigger.
@@ -1398,13 +1742,16 @@ class GoalManager:
         session_id = str(session_id or "").strip()
         if not session_id:
             raise ValueError("session_id must be a non-empty string")
-        self._state.waiting_on_session = session_id
-        self._state.waiting_on_pid = None
-        self._state.waiting_until = 0.0
-        self._state.waiting_reason = (reason or "").strip() or None
-        self._state.waiting_since = time.time()
-        save_goal(self.session_id, self._state)
-        return self._state
+        candidate = GoalState.from_json(self._state.to_json())
+        candidate.waiting_on_session = session_id
+        candidate.waiting_on_pid = None
+        candidate.waiting_until = 0.0
+        candidate.waiting_reason = (reason or "").strip() or None
+        candidate.waiting_since = time.time()
+        if not save_goal(self.session_id, candidate):
+            raise RuntimeError("could not persist session wait")
+        self._state = candidate
+        return candidate
 
     def wait_for_seconds(self, seconds: int, reason: str = "") -> GoalState:
         """Park the goal loop until ``seconds`` from now have elapsed.
@@ -1419,13 +1766,16 @@ class GoalManager:
         seconds = int(seconds)
         if seconds <= 0:
             raise ValueError("seconds must be a positive integer")
-        self._state.waiting_on_pid = None
-        self._state.waiting_on_session = None
-        self._state.waiting_until = time.time() + seconds
-        self._state.waiting_reason = (reason or "").strip() or None
-        self._state.waiting_since = time.time()
-        save_goal(self.session_id, self._state)
-        return self._state
+        candidate = GoalState.from_json(self._state.to_json())
+        candidate.waiting_on_pid = None
+        candidate.waiting_on_session = None
+        candidate.waiting_until = time.time() + seconds
+        candidate.waiting_reason = (reason or "").strip() or None
+        candidate.waiting_since = time.time()
+        if not save_goal(self.session_id, candidate):
+            raise RuntimeError("could not persist timed wait")
+        self._state = candidate
+        return candidate
 
     def stop_waiting(self) -> bool:
         """Clear any active wait barrier (pid / session / time). Returns True
@@ -1438,12 +1788,15 @@ class GoalManager:
             and not self._state.waiting_until
         ):
             return False
-        self._state.waiting_on_pid = None
-        self._state.waiting_on_session = None
-        self._state.waiting_until = 0.0
-        self._state.waiting_reason = None
-        self._state.waiting_since = 0.0
-        save_goal(self.session_id, self._state)
+        candidate = GoalState.from_json(self._state.to_json())
+        candidate.waiting_on_pid = None
+        candidate.waiting_on_session = None
+        candidate.waiting_until = 0.0
+        candidate.waiting_reason = None
+        candidate.waiting_since = 0.0
+        if not save_goal(self.session_id, candidate):
+            raise RuntimeError("could not persist cleared wait")
+        self._state = candidate
         return True
 
     def is_waiting(self) -> bool:
@@ -1535,6 +1888,10 @@ class GoalManager:
                 "message": f"⏳ Goal parked — waiting on {tgt}: {reason}",
             }
 
+        # Work on a detached candidate so a failed CAS/write cannot leak an
+        # unaccepted transition into the live manager state.
+        state = GoalState.from_json(self._state.to_json())
+
         # Count the turn that just finished.
         state.turns_used += 1
         state.last_turn_at = time.time()
@@ -1575,14 +1932,25 @@ class GoalManager:
         # the is_waiting() short-circuit once the barrier clears).
         if verdict == "wait" and wait_directive:
             if wait_directive.get("session_id"):
-                self.wait_on_session(str(wait_directive["session_id"]), reason=reason)
+                state.waiting_on_session = str(wait_directive["session_id"])
+                state.waiting_on_pid = None
+                state.waiting_until = 0.0
                 tgt = f"session {wait_directive['session_id']}"
             elif wait_directive.get("pid"):
-                self.wait_on(int(wait_directive["pid"]), reason=reason)
+                state.waiting_on_pid = int(wait_directive["pid"])
+                state.waiting_on_session = None
+                state.waiting_until = 0.0
                 tgt = f"pid {wait_directive['pid']}"
             else:
-                self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason)
+                state.waiting_on_pid = None
+                state.waiting_on_session = None
+                state.waiting_until = time.time() + int(wait_directive["seconds"])
                 tgt = f"{wait_directive['seconds']}s"
+            state.waiting_reason = "judge-directed wait"
+            state.waiting_since = time.time()
+            if not save_goal(self.session_id, state):
+                raise RuntimeError("could not persist judge wait")
+            self._state = state
             return {
                 "status": "active",
                 "should_continue": False,
@@ -1594,7 +1962,9 @@ class GoalManager:
 
         if verdict == "done":
             state.status = "done"
-            save_goal(self.session_id, state)
+            if not save_goal(self.session_id, state):
+                raise RuntimeError("could not persist completed goal evaluation")
+            self._state = state
             return {
                 "status": "done",
                 "should_continue": False,
@@ -1615,7 +1985,9 @@ class GoalManager:
                 f"judge API unreachable {state.consecutive_transport_failures} turns in a row "
                 f"(check auxiliary.goal_judge provider/key in config.yaml)"
             )
-            save_goal(self.session_id, state)
+            if not save_goal(self.session_id, state):
+                raise RuntimeError("could not persist transport-failure pause")
+            self._state = state
             return {
                 "status": "paused",
                 "should_continue": False,
@@ -1645,7 +2017,9 @@ class GoalManager:
             state.paused_reason = (
                 f"judge model returned unparseable output {state.consecutive_parse_failures} turns in a row"
             )
-            save_goal(self.session_id, state)
+            if not save_goal(self.session_id, state):
+                raise RuntimeError("could not persist parse-failure pause")
+            self._state = state
             return {
                 "status": "paused",
                 "should_continue": False,
@@ -1667,7 +2041,9 @@ class GoalManager:
         if state.turns_used >= state.max_turns:
             state.status = "paused"
             state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
-            save_goal(self.session_id, state)
+            if not save_goal(self.session_id, state):
+                raise RuntimeError("could not persist turn-budget pause")
+            self._state = state
             return {
                 "status": "paused",
                 "should_continue": False,
@@ -1680,7 +2056,9 @@ class GoalManager:
                 ),
             }
 
-        save_goal(self.session_id, state)
+        if not save_goal(self.session_id, state):
+            raise RuntimeError("could not persist goal evaluation")
+        self._state = state
         return {
             "status": "active",
             "should_continue": True,

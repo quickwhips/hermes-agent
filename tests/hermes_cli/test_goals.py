@@ -642,9 +642,17 @@ class TestMigrateGoalToSession:
 
     def test_failed_child_save_preserves_parent(self, hermes_home, monkeypatch):
         from hermes_cli import goals
-        from hermes_cli.goals import GoalState, load_goal, migrate_goal_to_session, save_goal
+        from hermes_cli.goals import (
+            GoalState,
+            _get_session_db,
+            load_goal,
+            migrate_goal_to_session,
+        )
 
-        assert save_goal("parent-save-failure", GoalState(goal="keep this checkpoint"))
+        _get_session_db().set_meta(
+            "goal:parent-save-failure",
+            GoalState(goal="keep this checkpoint").to_json(),
+        )
         real_save_goal = goals.save_goal
 
         def fail_child_save(session_id, state):
@@ -663,6 +671,394 @@ class TestMigrateGoalToSession:
         assert parent is not None
         assert parent.status == "active"
         assert load_goal("child-save-failure") is None
+
+    def test_migrates_durable_coordinator_binding_to_child(self, hermes_home):
+        from hermes_cli.goals import GoalManager, load_goal, migrate_goal_to_session
+
+        parent_manager = GoalManager("coordinator-parent")
+        parent = parent_manager.set("survive session rotation")
+
+        assert parent.coordinator_id
+        assert migrate_goal_to_session(
+            "coordinator-parent", "coordinator-child", reason="compression"
+        ) is True
+
+        child = load_goal("coordinator-child")
+        assert child is not None
+        assert child.coordinator_id == parent.coordinator_id
+        assert child.coordinator_version == parent.coordinator_version + 1
+        coordinator = parent_manager._db.get_goal_coordinator(parent.coordinator_id)
+        assert coordinator["session_id"] == "coordinator-child"
+        assert coordinator["status"] == "running"
+        assert coordinator["version"] == child.coordinator_version
+
+
+class TestDurableGoalCoordinatorIntegration:
+    def test_persistence_omits_model_generated_reason_text(self, hermes_home):
+        from hermes_cli.goals import GoalManager, _get_session_db, _meta_key, save_goal
+
+        manager = GoalManager("coordinator-sensitive-reason")
+        state = manager.set("keep model output out of durable state")
+        marker = "raw-judge-output-should-not-persist"
+        state.last_reason = marker
+
+        assert save_goal(manager.session_id, state)
+
+        raw = _get_session_db().get_meta(_meta_key(manager.session_id))
+        assert marker not in raw
+        assert manager._db.list_goal_coordinator_audit(state.coordinator_id)[-1][
+            "reason"
+        ] == "goal-state:active"
+
+    @pytest.mark.parametrize("method_name", ["set_contract", "pause", "clear"])
+    def test_control_mutations_fail_closed_when_persistence_fails(
+        self, hermes_home, monkeypatch, method_name
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalContract, GoalManager
+
+        manager = GoalManager(f"coordinator-failed-{method_name}")
+        original = manager.set("preserve accepted state")
+        original_json = original.to_json()
+        monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
+
+        with pytest.raises(RuntimeError, match="persist"):
+            if method_name == "set_contract":
+                manager.set_contract(GoalContract(verification="must not leak"))
+            elif method_name == "pause":
+                manager.pause("must not leak")
+            else:
+                manager.clear()
+
+        assert manager.state is original
+        assert manager.state.to_json() == original_json
+
+    @pytest.mark.parametrize("method_name", ["add_subgoal", "wait_for_seconds"])
+    def test_auxiliary_mutations_fail_closed_when_persistence_fails(
+        self, hermes_home, monkeypatch, method_name
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        manager = GoalManager(f"coordinator-failed-{method_name}")
+        original = manager.set("preserve accepted auxiliary state")
+        original_json = original.to_json()
+        monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
+
+        with pytest.raises(RuntimeError, match="persist"):
+            if method_name == "add_subgoal":
+                manager.add_subgoal("must not leak")
+            else:
+                manager.wait_for_seconds(30, "must not leak")
+
+        assert manager.state is original
+        assert manager.state.to_json() == original_json
+
+    def test_evaluation_fails_closed_when_persistence_fails(
+        self, hermes_home, monkeypatch
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        manager = GoalManager("coordinator-failed-evaluation")
+        original = manager.set("preserve accepted evaluation state")
+        original_json = original.to_json()
+        monkeypatch.setattr(
+            goals,
+            "judge_goal",
+            lambda *_args, **_kwargs: ("done", "model prose", False, None, False),
+        )
+        monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
+
+        with pytest.raises(RuntimeError, match="persist"):
+            manager.evaluate_after_turn("finished")
+
+        assert manager.state is original
+        assert manager.state.to_json() == original_json
+
+    def test_loading_legacy_goal_migrates_it_into_profile_coordinator(self, hermes_home):
+        from hermes_cli.goals import GoalManager, GoalState, _get_session_db
+
+        db = _get_session_db()
+        db.create_session("legacy-coordinator-session", source="cli")
+        db.set_meta(
+            "goal:legacy-coordinator-session",
+            GoalState(goal="migrate this legacy goal", status="paused").to_json(),
+        )
+
+        manager = GoalManager("legacy-coordinator-session")
+
+        assert manager.state.coordinator_id
+        assert manager.state.coordinator_version == 2
+        coordinator = manager._db.get_goal_coordinator(manager.state.coordinator_id)
+        assert coordinator["status"] == "yielded"
+        assert coordinator["session_id"] == "legacy-coordinator-session"
+
+    def test_ended_legacy_goal_migrates_as_orphaned_not_active(self, hermes_home):
+        from hermes_cli.goals import GoalManager, GoalState, _get_session_db
+
+        session_id = "legacy-ended-coordinator-session"
+        db = _get_session_db()
+        db.create_session(session_id, source="cli")
+        db.end_session(session_id, "agent_close")
+        db.set_meta(
+            f"goal:{session_id}",
+            GoalState(goal="recover this legacy goal later", status="active").to_json(),
+        )
+
+        manager = GoalManager(session_id)
+
+        assert manager.state is None
+        resumable = db.find_resumable_goal_coordinators("default")
+        migrated = next(item for item in resumable if item["session_id"] == session_id)
+        assert migrated["status"] == "orphaned"
+
+    def test_save_goal_without_coordinator_migrates_in_same_write(self, hermes_home):
+        from hermes_cli.goals import GoalState, load_goal, save_goal
+
+        state = GoalState(goal="migrate before write", status="active")
+        assert save_goal("mandatory-migration-session", state)
+
+        loaded = load_goal("mandatory-migration-session")
+        assert loaded.coordinator_id
+        assert loaded.coordinator_version == 2
+
+    def test_set_creates_coordinator_and_compact_resume_metadata(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        manager = GoalManager("coordinator-session")
+        state = manager.set("finish the durable coordinator")
+
+        assert state.coordinator_id
+        assert state.coordinator_version == 2
+        coordinator = manager._db.get_goal_coordinator(state.coordinator_id)
+        assert coordinator["status"] == "running"
+        assert coordinator["session_id"] == "coordinator-session"
+        resume = manager._db.get_goal_resume(state.coordinator_id)
+        assert resume["goal"] == "finish the durable coordinator"
+        assert resume["version"] == 2
+
+    def test_contract_updates_are_versioned_in_coordinator(self, hermes_home):
+        from hermes_cli.goals import GoalContract, GoalManager
+
+        manager = GoalManager("coordinator-contract-session")
+        state = manager.set("keep the acceptance contract durable")
+
+        manager.set_contract(GoalContract(verification="focused tests pass"))
+
+        coordinator = manager._db.get_goal_coordinator(state.coordinator_id)
+        assert coordinator["version"] == 3
+        assert coordinator["acceptance_contract"]["verification"] == (
+            "focused tests pass"
+        )
+
+    def test_replacing_goal_cancels_previous_coordinator(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        manager = GoalManager("coordinator-replacement-session")
+        first = manager.set("first durable goal")
+        first_id = first.coordinator_id
+
+        second = manager.set("replacement durable goal")
+
+        assert second.coordinator_id != first_id
+        assert manager._db.get_goal_coordinator(first_id)["status"] == "cancelled"
+        assert manager._db.get_goal_coordinator(second.coordinator_id)["status"] == "running"
+
+    def test_concurrent_managers_cannot_create_two_live_goals_for_one_session(
+        self, hermes_home
+    ):
+        from hermes_cli.goals import GoalManager
+
+        first = GoalManager("coordinator-concurrent-create")
+        stale = GoalManager("coordinator-concurrent-create")
+
+        accepted = first.set("first live goal wins")
+        with pytest.raises(RuntimeError, match="could not persist"):
+            stale.set("stale manager must fail closed")
+
+        coordinators = first._db._conn.execute(
+            """SELECT id FROM goal_coordinators
+               WHERE session_id = ?
+                 AND status IN ('created', 'running', 'checkpointing',
+                                'yielded', 'needs_continuation')""",
+            ("coordinator-concurrent-create",),
+        ).fetchall()
+        assert [row["id"] for row in coordinators] == [accepted.coordinator_id]
+
+    def test_session_termination_orphans_and_resume_reclaims_coordinator(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        session_id = "coordinator-session-termination"
+        manager = GoalManager(session_id)
+        state = manager.set("survive PTY and gateway termination")
+        manager._db.create_session(session_id, source="cli")
+
+        manager._db.end_session(session_id, "agent_close")
+
+        orphaned = manager._db.get_goal_coordinator(state.coordinator_id)
+        assert orphaned["status"] == "orphaned"
+        assert orphaned["version"] == 3
+        assert state.coordinator_id in {
+            item["id"]
+            for item in manager._db.find_resumable_goal_coordinators(
+                orphaned["profile_name"]
+            )
+        }
+
+        old_session = GoalManager(session_id)
+        assert old_session.state is None
+        assert old_session._db.get_goal_coordinator(state.coordinator_id)[
+            "status"
+        ] == "orphaned"
+
+        resumed = GoalManager("coordinator-successor-session")
+        resumed.resume_durable(state.coordinator_id)
+        reclaimed = resumed._db.get_goal_coordinator(state.coordinator_id)
+        assert resumed.state.coordinator_version == 4
+        assert reclaimed["status"] == "running"
+        assert reclaimed["version"] == 4
+        assert reclaimed["session_id"] == "coordinator-successor-session"
+        discovered = resumed._db.find_resumable_goal_coordinators(
+            orphaned["profile_name"]
+        )
+        assert all(item["id"] != state.coordinator_id for item in discovered)
+
+    def test_reopened_original_session_reclaims_its_orphaned_goal(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        session_id = "coordinator-reopened-original"
+        manager = GoalManager(session_id)
+        state = manager.set("survive an explicit conversational resume")
+        manager._db.create_session(session_id, source="cli")
+        manager._db.end_session(session_id, "agent_close")
+        assert manager._db.get_goal_coordinator(state.coordinator_id)[
+            "status"
+        ] == "orphaned"
+
+        manager._db.reopen_session(session_id)
+        reopened = GoalManager(session_id)
+
+        assert reopened.state.coordinator_id == state.coordinator_id
+        assert reopened._db.get_goal_coordinator(state.coordinator_id)[
+            "status"
+        ] == "running"
+
+    def test_resume_durable_refuses_to_overwrite_active_session_binding(
+        self, hermes_home
+    ):
+        from hermes_cli.goals import GoalManager
+
+        target = GoalManager("coordinator-occupied-target")
+        existing = target.set("keep the existing bound goal")
+
+        source_session = "coordinator-orphan-source"
+        source = GoalManager(source_session)
+        orphan = source.set("resume me only into an unbound successor")
+        source._db.create_session(source_session, source="cli")
+        source._db.end_session(source_session, "agent_close")
+
+        with pytest.raises(RuntimeError, match="already has an active goal"):
+            target.resume_durable(orphan.coordinator_id)
+
+        assert target.state.coordinator_id == existing.coordinator_id
+        assert target._db.get_goal_coordinator(existing.coordinator_id)[
+            "status"
+        ] == "running"
+        assert target._db.get_goal_coordinator(orphan.coordinator_id)[
+            "status"
+        ] == "orphaned"
+
+    def test_resume_durable_refuses_to_move_yielded_goal_from_live_session(
+        self, hermes_home
+    ):
+        from hermes_cli.goals import GoalManager
+
+        source_session = "coordinator-live-yield-source"
+        source = GoalManager(source_session)
+        source._db.create_session(source_session, source="cli")
+        yielded = source.set("stay bound while the original session is live")
+        source.pause("user-paused")
+        assert source._db.get_goal_coordinator(yielded.coordinator_id)[
+            "status"
+        ] == "yielded"
+
+        successor = GoalManager("coordinator-live-yield-successor")
+        with pytest.raises(RuntimeError, match="original session is still live"):
+            successor.resume_durable(yielded.coordinator_id)
+
+        assert source._db.get_goal_coordinator(yielded.coordinator_id)[
+            "session_id"
+        ] == source_session
+        assert successor.state is None
+
+    def test_resume_durable_refuses_orphan_after_original_session_reopens(
+        self, hermes_home
+    ):
+        from hermes_cli.goals import GoalManager
+
+        source_session = "coordinator-reopened-before-bind"
+        source = GoalManager(source_session)
+        source._db.create_session(source_session, source="cli")
+        orphan = source.set("remain with the reopened original session")
+        source._db.end_session(source_session, "agent_close")
+        source._db.reopen_session(source_session)
+
+        successor = GoalManager("coordinator-reopened-bind-successor")
+        with pytest.raises(RuntimeError, match="original session is still live"):
+            successor.resume_durable(orphan.coordinator_id)
+
+        assert source._db.get_goal_coordinator(orphan.coordinator_id)[
+            "status"
+        ] == "orphaned"
+
+    def test_checkpoint_and_resume_update_durable_coordinator(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        manager = GoalManager("coordinator-checkpoint-session")
+        state = manager.set("continue after a bounded slice", max_turns=1)
+        checkpoint = manager.checkpoint_after_max_iterations(
+            "max_iterations_reached(3/3)"
+        )
+
+        assert checkpoint
+        assert manager.state.coordinator_version == 3
+        coordinator = manager._db.get_goal_coordinator(state.coordinator_id)
+        assert coordinator["status"] == "needs_continuation"
+        assert coordinator["checkpoint"]["checkpoint_id"] == checkpoint["id"]
+        assert coordinator["checkpoint"]["milestone"]["sequence"] == 3
+        assert coordinator["checkpoint"]["budget"] == {"used": 3, "maximum": 3}
+        assert set(coordinator["checkpoint"]["repository"]) == {
+            "root",
+            "worktree",
+            "branch",
+            "head_sha",
+            "ahead",
+            "behind",
+            "dirty",
+        }
+        assert manager._db.get_goal_resume(state.coordinator_id)["next_action"] == (
+            "Resume the goal in a fresh bounded model slice."
+        )
+
+        resumed = manager.resume()
+        assert resumed.coordinator_version == 4
+        assert manager._db.get_goal_coordinator(state.coordinator_id)["status"] == "running"
+
+    def test_stale_manager_cannot_overwrite_newer_checkpoint(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        first = GoalManager("coordinator-stale-session")
+        first.set("protect the newer checkpoint", max_turns=1)
+        stale = GoalManager("coordinator-stale-session")
+
+        assert first.checkpoint_after_max_iterations("max_iterations_reached(1/1)")
+        assert stale.checkpoint_after_max_iterations("max_iterations_reached(1/1)") == {}
+
+        coordinator = first._db.get_goal_coordinator(first.state.coordinator_id)
+        assert coordinator["status"] == "needs_continuation"
+        assert coordinator["version"] == 3
+        assert stale.state.status == "active"
 
 
 class TestGoalManagerSubgoals:

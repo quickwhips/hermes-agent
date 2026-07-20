@@ -93,7 +93,7 @@ stop when: a DB schema migration is required
 
 The first non-field line(s) are the goal headline; recognized field prefixes (`verify:`, `verified by:`, `constraints:`, `preserve:`, `boundaries:`, `scope:`, `stop when:`, `blocked:`, …) populate the contract. A plain goal with an incidental colon (`Fix bug: the parser drops commas`) is **not** mangled — only known field prefixes are pulled out.
 
-Use `/goal show` to review the active contract. Contracts persist in `SessionDB.state_meta` alongside the goal, so they survive `/resume`. Old goals from before this feature load unchanged (no contract). Contracts and `/subgoal` criteria compose: subgoals fold into the contract as extra criteria the judge must also satisfy.
+Use `/goal show` to review the active contract. Contracts persist in the profile-scoped `SessionDB` alongside the goal, so they survive `/resume`. Old goals from before this feature load unchanged (no contract). Contracts and `/subgoal` criteria compose: subgoals fold into the contract as extra criteria the judge must also satisfy.
 
 ## Adding criteria mid-goal: `/subgoal`
 
@@ -106,7 +106,7 @@ While a goal is active you can append extra acceptance criteria with `/subgoal <
 | `/subgoal remove <N>` | Remove the Nth subgoal (1-based). |
 | `/subgoal clear` | Drop every subgoal but keep the original goal intact. |
 
-Subgoals are persisted alongside the goal in `SessionDB.state_meta`, so they survive `/resume`. Setting a new `/goal <text>` replaces the goal and clears the subgoal list; `/goal clear` does the same.
+Subgoals are persisted alongside the goal in the profile-scoped `SessionDB`, so they survive `/resume`. Setting a new `/goal <text>` replaces the goal and clears the subgoal list; `/goal clear` does the same.
 
 Use this when you start a loop ("fix the failing tests") and notice partway through that you also want it to "and add a regression test for the bug you just patched" — `/subgoal add a regression test` tightens the success criteria without breaking the running loop.
 
@@ -167,9 +167,17 @@ Any real message you send while a goal is active takes priority over the continu
 
 While an agent is already running, `/goal status`, `/goal pause`, `/goal clear`, `/goal wait`, and `/goal unwait` are safe to run — they only touch control-plane state and don't interrupt the current turn. Setting a **new** goal mid-run (`/goal <new text>`) is rejected with a message telling you to `/stop` first, so the old continuation can't race the new one.
 
-### Persistence
+### Persistence, retention, backup, and rollback
 
-Goal state lives in `SessionDB.state_meta` keyed by `goal:<session_id>`. That means `/resume` picks up right where you left off — set a goal, close your laptop, come back tomorrow, `/resume`, and the goal is still standing exactly as you left it (active, paused, or done).
+Each new goal has a profile-scoped durable coordinator row in `state.db`, plus a small compatibility binding keyed by `goal:<session_id>` so existing `/resume` paths keep working. The coordinator has its own identity and lifecycle version: rotating or deleting the conversational session does not delete the goal. Checkpoint writes use one `BEGIN IMMEDIATE` transaction for the coordinator, audit event, and compatibility binding. Stale writers and invalid lifecycle transitions are rejected and recorded without changing the accepted checkpoint.
+
+The coordinator store exposes compact discovery and explicit successor-binding APIs for recovery callers. The current `/goal resume` command resumes only the goal already bound to that conversational session; a user-facing list/select/Resume surface for orphaned coordinators is a separate recovery-UX change.
+
+Coordinator checkpoints are bounded, allowlisted structured JSON. They may contain milestone, repository/worktree, changed-file, validation, child-session, blocker, approval, artifact, next-action, and continuation-summary metadata. Each accepted checkpoint is also appended to an ordered, versioned milestone history while the compact Resume read loads only the current handoff. Raw-response, transcript, tool-output, credential, and arbitrary extension field names are rejected; string values are bounded and credential-scanned, and oversized payloads are rejected rather than persisted.
+
+Retention is intentionally conservative: active, yielded, orphaned, and `needs_continuation` coordinators are retained even when their conversation history is pruned. Terminal coordinator cleanup is a separate future policy decision; session pruning must not silently remove durable work.
+
+`hermes backup --quick` includes the profile's `state.db`, so it captures coordinator records and their audit trail. For a full archive use `hermes backup`. Restore the matching profile backup as a unit rather than copying individual goal rows between profiles. SQLite transaction rollback preserves the previous accepted coordinator version after a failed checkpoint; restoring an older backup is the operator rollback path for already-committed state.
 
 ### Prompt cache
 

@@ -28,7 +28,7 @@ from pathlib import Path
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -860,6 +860,47 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS goal_coordinators (
+    id TEXT PRIMARY KEY,
+    profile_name TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    acceptance_contract_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    session_id TEXT,
+    current_milestone_json TEXT,
+    checkpoint_json TEXT,
+    next_action TEXT,
+    continuation_summary TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS goal_coordinator_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id TEXT NOT NULL REFERENCES goal_coordinators(id) ON DELETE CASCADE,
+    event TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT,
+    expected_version INTEGER,
+    result_version INTEGER,
+    accepted INTEGER NOT NULL,
+    reason TEXT,
+    metadata_json TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS goal_coordinator_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id TEXT NOT NULL REFERENCES goal_coordinators(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    checkpoint_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(goal_id, version)
+);
+
 CREATE TABLE IF NOT EXISTS gateway_routing (
     scope TEXT NOT NULL DEFAULT '',
     session_key TEXT NOT NULL,
@@ -897,6 +938,12 @@ CREATE TABLE IF NOT EXISTS async_delegations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+CREATE INDEX IF NOT EXISTS idx_goal_coordinators_status
+ON goal_coordinators(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_goal_coordinator_audit_goal
+ON goal_coordinator_audit(goal_id, id);
+CREATE INDEX IF NOT EXISTS idx_goal_coordinator_checkpoints_goal
+ON goal_coordinator_checkpoints(goal_id, version);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
@@ -2356,6 +2403,76 @@ class SessionDB:
             ).fetchone()
         return dict(row) if row else None
 
+    def _orphan_goal_coordinators_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        session_ids: Sequence[str],
+        *,
+        reason: str,
+        now: Optional[float] = None,
+    ) -> None:
+        """Detach active coordinators from terminal/session lifecycle in one transaction."""
+        ids = [str(session_id) for session_id in session_ids if session_id]
+        if not ids:
+            return
+        now = time.time() if now is None else now
+        reason = str(reason or "session-lifecycle-ended")[:1024]
+        placeholders = ",".join("?" * len(ids))
+        rows = conn.execute(
+            f"""SELECT id, session_id, status, version FROM goal_coordinators
+                WHERE session_id IN ({placeholders})
+                  AND status IN ('created', 'running', 'checkpointing',
+                                 'yielded', 'needs_continuation')""",
+            ids,
+        ).fetchall()
+        for row in rows:
+            next_version = row["version"] + 1
+            cursor = conn.execute(
+                """UPDATE goal_coordinators
+                   SET status = 'orphaned', version = ?, updated_at = ?
+                   WHERE id = ? AND version = ?""",
+                (next_version, now, row["id"], row["version"]),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("stale goal coordinator during session orphaning")
+            conn.execute(
+                """INSERT INTO goal_coordinator_audit (
+                       goal_id, event, from_status, to_status, expected_version,
+                       result_version, accepted, reason, metadata_json, created_at
+                   ) VALUES (?, 'transition', ?, 'orphaned', ?, ?, 1, ?, '{}', ?)""",
+                (
+                    row["id"],
+                    row["status"],
+                    row["version"],
+                    next_version,
+                    reason,
+                    now,
+                ),
+            )
+            meta_key = f"goal:{row['session_id']}"
+            meta_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (meta_key,)
+            ).fetchone()
+            if meta_row is None:
+                continue
+            try:
+                state = json.loads(meta_row["value"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(state, dict) and state.get("coordinator_id") == row["id"]:
+                state["coordinator_version"] = next_version
+                conn.execute(
+                    "UPDATE state_meta SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            state,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        meta_key,
+                    ),
+                )
+
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended.
 
@@ -2367,10 +2484,19 @@ class SessionDB:
         intentionally need to re-end a closed session with a new reason.
         """
         def _do(conn):
-            conn.execute(
+            now = time.time()
+            cursor = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND ended_at IS NULL",
-                (time.time(), end_reason, session_id),
+                (now, end_reason, session_id),
+            )
+            if cursor.rowcount != 1:
+                return
+            self._orphan_goal_coordinators_in_tx(
+                conn,
+                [session_id],
+                reason=f"session-ended:{end_reason}",
+                now=now,
             )
         self._execute_write(_do)
 
@@ -2424,6 +2550,13 @@ class SessionDB:
                 "OR end_reason IN ('agent_close', 'ws_orphan_reap'))",
                 (now, reason, session_id),
             )
+            if cursor.rowcount:
+                self._orphan_goal_coordinators_in_tx(
+                    conn,
+                    [session_id],
+                    reason=f"session-ended:{reason}",
+                    now=now,
+                )
             return cursor.rowcount
 
         try:
@@ -3196,6 +3329,11 @@ class SessionDB:
             """, (cutoff,)).fetchall()
             ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in rows]
             if ids:
+                self._orphan_goal_coordinators_in_tx(
+                    conn,
+                    ids,
+                    reason="session-deleted:ghost-prune",
+                )
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
                     f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
@@ -3221,11 +3359,9 @@ class SessionDB:
 
         def _do(conn):
             now = time.time()
-            result = conn.execute(
+            rows = conn.execute(
                 """
-                UPDATE sessions
-                SET ended_at = ?,
-                    end_reason = 'orphaned_compression'
+                SELECT id FROM sessions
                 WHERE api_call_count = 0
                   AND end_reason IS NULL
                   AND ended_at IS NULL
@@ -3242,9 +3378,25 @@ class SessionDB:
                       WHERE m.session_id = sessions.id
                   )
                 """,
-                (now, cutoff),
+                (cutoff,),
+            ).fetchall()
+            session_ids = [row["id"] for row in rows]
+            if not session_ids:
+                return 0
+            placeholders = ",".join("?" * len(session_ids))
+            conn.execute(
+                f"""UPDATE sessions
+                    SET ended_at = ?, end_reason = 'orphaned_compression'
+                    WHERE id IN ({placeholders})""",
+                [now, *session_ids],
             )
-            return result.rowcount
+            self._orphan_goal_coordinators_in_tx(
+                conn,
+                session_ids,
+                reason="session-ended:orphaned-compression",
+                now=now,
+            )
+            return len(session_ids)
 
         return self._execute_write(_do) or 0
 
@@ -6501,6 +6653,11 @@ class SessionDB:
             if cursor.fetchone()[0] == 0:
                 return False
             removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
+            self._orphan_goal_coordinators_in_tx(
+                conn,
+                [session_id, *removed_delegate_ids],
+                reason="session-deleted:single",
+            )
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
             conn.execute(
                 "UPDATE sessions SET parent_session_id = NULL "
@@ -6538,9 +6695,9 @@ class SessionDB:
         flushed. Returns True if the session was deleted.
         """
         def _do(conn):
-            cursor = conn.execute(
+            row = conn.execute(
                 """
-                DELETE FROM sessions
+                SELECT id FROM sessions
                 WHERE id = ?
                   AND title IS NULL
                   AND NOT EXISTS (
@@ -6552,8 +6709,16 @@ class SessionDB:
                   )
                 """,
                 (session_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            self._orphan_goal_coordinators_in_tx(
+                conn,
+                [session_id],
+                reason="session-deleted:if-empty",
             )
-            return cursor.rowcount > 0
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            return True
 
         deleted = self._execute_write(_do)
         if deleted:
@@ -6615,6 +6780,11 @@ class SessionDB:
 
             existing_placeholders = ",".join("?" * len(existing))
             removed_delegate_ids.extend(_delete_delegate_children(conn, existing))
+            self._orphan_goal_coordinators_in_tx(
+                conn,
+                [*existing, *removed_delegate_ids],
+                reason="session-deleted:bulk",
+            )
             # Orphan remaining children whose parent is in the kill list so the
             # FK constraint stays satisfied. Pin children whose parent
             # is itself in the kill list rather than NULL-ing parents
@@ -6711,6 +6881,11 @@ class SessionDB:
             if not session_ids:
                 return 0
 
+            self._orphan_goal_coordinators_in_tx(
+                conn,
+                list(session_ids),
+                reason="session-deleted:empty-bulk",
+            )
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(
                 f"UPDATE sessions SET parent_session_id = NULL "
@@ -6962,6 +7137,11 @@ class SessionDB:
             if not session_ids:
                 return 0
 
+            self._orphan_goal_coordinators_in_tx(
+                conn,
+                list(session_ids),
+                reason="session-deleted:prune",
+            )
             # Orphan any sessions whose parent is about to be deleted
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(
@@ -6981,6 +7161,772 @@ class SessionDB:
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
         return count
+
+    # ── Durable goal coordinators ──
+
+    _GOAL_COORDINATOR_STATUSES = frozenset({
+        "created",
+        "running",
+        "checkpointing",
+        "yielded",
+        "completed",
+        "failed",
+        "cancelled",
+        "needs_continuation",
+        "orphaned",
+    })
+    _GOAL_COORDINATOR_TRANSITIONS = {
+        "created": frozenset({
+            "running",
+            "yielded",
+            "needs_continuation",
+            "failed",
+            "cancelled",
+            "orphaned",
+        }),
+        "running": frozenset({
+            "checkpointing",
+            "yielded",
+            "completed",
+            "failed",
+            "cancelled",
+            "needs_continuation",
+            "orphaned",
+        }),
+        "checkpointing": frozenset({
+            "running",
+            "yielded",
+            "completed",
+            "failed",
+            "cancelled",
+            "needs_continuation",
+        }),
+        "yielded": frozenset({"running", "failed", "cancelled", "orphaned"}),
+        "needs_continuation": frozenset({"running", "failed", "cancelled", "orphaned"}),
+        "orphaned": frozenset({
+            "running",
+            "yielded",
+            "failed",
+            "cancelled",
+            "needs_continuation",
+        }),
+        "completed": frozenset(),
+        "failed": frozenset(),
+        "cancelled": frozenset(),
+    }
+    _GOAL_FORBIDDEN_FIELDS = frozenset({
+        "apikey",
+        "accesstoken",
+        "refreshtoken",
+        "authorization",
+        "credential",
+        "credentials",
+        "password",
+        "passwd",
+        "privatekey",
+        "rawmodelresponse",
+        "rawresponse",
+        "secret",
+        "token",
+        "tooloutput",
+        "transcript",
+        "messages",
+    })
+    _GOAL_MAX_JSON_BYTES = 64 * 1024
+    _GOAL_MAX_STRING_CHARS = 8192
+    _GOAL_MAX_COLLECTION_ITEMS = 200
+    _GOAL_MAX_DEPTH = 8
+    _GOAL_CHECKPOINT_FIELDS = frozenset({
+        "checkpoint_id",
+        "reason",
+        "budget",
+        "milestone",
+        "repository",
+        "files_changed",
+        "validation",
+        "child_sessions",
+        "blockers",
+        "approvals_needed",
+        "artifacts",
+        "next_action",
+        "continuation_summary",
+    })
+    _GOAL_CONTRACT_FIELDS = frozenset({
+        "outcome",
+        "verification",
+        "constraints",
+        "boundaries",
+        "stop_when",
+        "criteria",
+    })
+    _GOAL_AUDIT_METADATA_FIELDS = frozenset({
+        "actor",
+        "source",
+        "slice_id",
+        "worker_id",
+    })
+    _GOAL_CHECKPOINT_OBJECT_FIELDS = {
+        "budget": frozenset({"used", "maximum"}),
+        "milestone": frozenset({"id", "title", "sequence", "criteria", "status"}),
+        "repository": frozenset({
+            "root",
+            "worktree",
+            "branch",
+            "head_sha",
+            "ahead",
+            "behind",
+            "dirty",
+        }),
+    }
+    _GOAL_CHECKPOINT_LIST_OBJECT_FIELDS = {
+        "validation": frozenset({"command", "status", "summary", "artifact_path"}),
+        "child_sessions": frozenset({"id", "status", "summary"}),
+    }
+    _GOAL_LEGACY_STATE_FIELDS = frozenset({
+        "goal",
+        "status",
+        "turns_used",
+        "max_turns",
+        "created_at",
+        "last_turn_at",
+        "last_verdict",
+        "last_reason",
+        "paused_reason",
+        "consecutive_parse_failures",
+        "consecutive_transport_failures",
+        "subgoals",
+        "waiting_on_pid",
+        "waiting_on_session",
+        "waiting_until",
+        "waiting_reason",
+        "waiting_since",
+        "contract",
+        "checkpoint_id",
+        "checkpoint_at",
+        "checkpoint_reason",
+        "checkpoint_budget_used",
+        "checkpoint_budget_max",
+        "checkpoint_summary",
+        "coordinator_id",
+        "coordinator_version",
+    })
+
+    @classmethod
+    def _validate_goal_payload(cls, payload: Any, *, label: str) -> str:
+        """Validate and serialize bounded, credential-free coordinator JSON."""
+        def _walk(value: Any, depth: int) -> None:
+            if depth > cls._GOAL_MAX_DEPTH:
+                raise ValueError(f"{label} is too large: nesting exceeds {cls._GOAL_MAX_DEPTH}")
+            if isinstance(value, dict):
+                if len(value) > cls._GOAL_MAX_COLLECTION_ITEMS:
+                    raise ValueError(f"{label} is too large: too many fields")
+                for key, child in value.items():
+                    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                    if normalized in cls._GOAL_FORBIDDEN_FIELDS:
+                        raise ValueError(f"{label} contains forbidden field: {key}")
+                    _walk(child, depth + 1)
+                return
+            if isinstance(value, (list, tuple)):
+                if len(value) > cls._GOAL_MAX_COLLECTION_ITEMS:
+                    raise ValueError(f"{label} is too large: too many items")
+                for child in value:
+                    _walk(child, depth + 1)
+                return
+            if isinstance(value, str):
+                if len(value) > cls._GOAL_MAX_STRING_CHARS:
+                    raise ValueError(f"{label} is too large: string field exceeds limit")
+                if "-----BEGIN " in value and "PRIVATE KEY-----" in value:
+                    raise ValueError(f"{label} contains credential material")
+                if re.search(r"\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,})\b", value):
+                    raise ValueError(f"{label} contains credential material")
+                if re.search(r"(?i)\bBearer\s+[A-Za-z0-9._-]{20,}\b", value):
+                    raise ValueError(f"{label} contains credential material")
+                try:
+                    from agent.redact import redact_sensitive_text
+
+                    redacted = redact_sensitive_text(
+                        value,
+                        force=True,
+                        redact_url_credentials=True,
+                    )
+                except Exception as exc:
+                    raise ValueError(
+                        f"{label} credential validation is unavailable"
+                    ) from exc
+                if redacted != value:
+                    raise ValueError(f"{label} contains credential material")
+                return
+            if value is not None and not isinstance(value, (bool, int, float)):
+                raise ValueError(f"{label} contains unsupported value type")
+
+        if payload is None:
+            payload = {}
+        _walk(payload, 0)
+        try:
+            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} is not JSON serializable") from exc
+        if len(encoded.encode("utf-8")) > cls._GOAL_MAX_JSON_BYTES:
+            raise ValueError(f"{label} is too large: payload exceeds byte limit")
+        return encoded
+
+    @classmethod
+    def _validate_goal_checkpoint(cls, checkpoint: Dict[str, Any]) -> str:
+        if not isinstance(checkpoint, dict):
+            raise ValueError("checkpoint must be an object")
+        unknown = set(checkpoint) - cls._GOAL_CHECKPOINT_FIELDS
+        if unknown:
+            raise ValueError(
+                f"unsupported checkpoint field: {sorted(unknown)[0]}"
+            )
+        for key, allowed in cls._GOAL_CHECKPOINT_OBJECT_FIELDS.items():
+            if key in checkpoint and not isinstance(checkpoint[key], dict):
+                raise ValueError(f"checkpoint {key} must be an object")
+            if key in checkpoint:
+                nested_unknown = set(checkpoint[key]) - allowed
+                if nested_unknown:
+                    raise ValueError(
+                        f"unsupported {key} field: {sorted(nested_unknown)[0]}"
+                    )
+        for key in (
+            "files_changed",
+            "validation",
+            "child_sessions",
+            "blockers",
+            "approvals_needed",
+            "artifacts",
+        ):
+            if key in checkpoint and not isinstance(checkpoint[key], list):
+                raise ValueError(f"checkpoint {key} must be a list")
+        for key, allowed in cls._GOAL_CHECKPOINT_LIST_OBJECT_FIELDS.items():
+            for item in checkpoint.get(key, []):
+                if not isinstance(item, dict):
+                    raise ValueError(f"checkpoint {key} items must be objects")
+                nested_unknown = set(item) - allowed
+                if nested_unknown:
+                    label = key[:-1] if key.endswith("s") else key
+                    raise ValueError(
+                        f"unsupported {label} field: {sorted(nested_unknown)[0]}"
+                    )
+        for key in ("files_changed", "blockers", "approvals_needed", "artifacts"):
+            if any(not isinstance(item, str) for item in checkpoint.get(key, [])):
+                raise ValueError(f"checkpoint {key} items must be strings")
+        return cls._validate_goal_payload(checkpoint, label="checkpoint")
+
+    @classmethod
+    def _validate_goal_contract(cls, contract: Dict[str, Any]) -> str:
+        if not isinstance(contract, dict):
+            raise ValueError("acceptance contract must be an object")
+        unknown = set(contract) - cls._GOAL_CONTRACT_FIELDS
+        if unknown:
+            raise ValueError(
+                f"unsupported acceptance contract field: {sorted(unknown)[0]}"
+            )
+        return cls._validate_goal_payload(contract, label="acceptance contract")
+
+    @classmethod
+    def _validate_legacy_goal_state(cls, raw: Optional[str]) -> Optional[str]:
+        if raw is None:
+            return None
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("legacy goal state is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("legacy goal state must be an object")
+        unknown = set(payload) - cls._GOAL_LEGACY_STATE_FIELDS
+        if unknown:
+            raise ValueError(
+                f"unsupported legacy goal field: {sorted(unknown)[0]}"
+            )
+        contract = payload.get("contract", {})
+        cls._validate_goal_contract(contract)
+        return cls._validate_goal_payload(payload, label="legacy goal state")
+
+    @staticmethod
+    def _decode_goal_json(raw: Optional[str], default: Any) -> Any:
+        if not raw:
+            return default
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _goal_coordinator_row(cls, row: sqlite3.Row) -> Dict[str, Any]:
+        result = dict(row)
+        result["acceptance_contract"] = cls._decode_goal_json(
+            result.pop("acceptance_contract_json", None), {}
+        )
+        result["current_milestone"] = cls._decode_goal_json(
+            result.pop("current_milestone_json", None), None
+        )
+        result["checkpoint"] = cls._decode_goal_json(
+            result.pop("checkpoint_json", None), None
+        )
+        return result
+
+    def create_goal_coordinator(
+        self,
+        *,
+        goal_id: str,
+        profile_name: str,
+        goal: str,
+        acceptance_contract: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        activate_status: Optional[str] = None,
+        legacy_meta_key: Optional[str] = None,
+        legacy_state_json: Optional[str] = None,
+        supersede_goal_id: Optional[str] = None,
+        supersede_expected_version: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Create an independent durable goal record and its first audit row."""
+        goal_id = str(goal_id or "").strip()
+        profile_name = str(profile_name or "").strip()
+        goal = str(goal or "").strip()
+        if not goal_id or not profile_name or not goal:
+            raise ValueError("goal_id, profile_name, and goal are required")
+        if len(goal_id) > 128 or len(profile_name) > 128 or len(goal) > 8192:
+            raise ValueError("goal coordinator identity or goal is too large")
+        if activate_status is not None and activate_status not in self._GOAL_COORDINATOR_STATUSES:
+            raise ValueError(f"unknown goal coordinator status: {activate_status}")
+        if activate_status == "created":
+            activate_status = None
+        self._validate_goal_payload({"goal": goal}, label="goal")
+        contract_json = self._validate_goal_contract(acceptance_contract or {})
+        legacy_state_json = self._validate_legacy_goal_state(legacy_state_json)
+        now = time.time()
+
+        def _do(conn):
+            if session_id:
+                conflicting = conn.execute(
+                    """SELECT id FROM goal_coordinators
+                       WHERE session_id = ?
+                         AND status IN ('created', 'running', 'checkpointing',
+                                        'yielded', 'needs_continuation')
+                       LIMIT 1""",
+                    (str(session_id),),
+                ).fetchone()
+                if conflicting is not None and conflicting["id"] != supersede_goal_id:
+                    raise RuntimeError(
+                        "target session already has an active goal coordinator"
+                    )
+            if supersede_goal_id is not None:
+                if supersede_expected_version is None:
+                    raise ValueError("supersede_expected_version is required")
+                prior = conn.execute(
+                    "SELECT status, version FROM goal_coordinators WHERE id = ?",
+                    (supersede_goal_id,),
+                ).fetchone()
+                if prior is None or prior["version"] != int(supersede_expected_version):
+                    raise RuntimeError("stale superseded goal coordinator version")
+                if prior["status"] not in {
+                    "created",
+                    "running",
+                    "checkpointing",
+                    "yielded",
+                    "needs_continuation",
+                    "orphaned",
+                }:
+                    raise RuntimeError("cannot supersede a terminal goal coordinator")
+                next_prior_version = prior["version"] + 1
+                cursor = conn.execute(
+                    """UPDATE goal_coordinators
+                       SET status = 'cancelled', version = ?, updated_at = ?, completed_at = ?
+                       WHERE id = ? AND version = ?""",
+                    (
+                        next_prior_version,
+                        now,
+                        now,
+                        supersede_goal_id,
+                        int(supersede_expected_version),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("stale superseded goal coordinator version")
+                conn.execute(
+                    """INSERT INTO goal_coordinator_audit (
+                           goal_id, event, from_status, to_status, expected_version,
+                           result_version, accepted, reason, metadata_json, created_at
+                       ) VALUES (?, 'transition', ?, 'cancelled', ?, ?, 1,
+                                 'superseded-by-new-goal', '{}', ?)""",
+                    (
+                        supersede_goal_id,
+                        prior["status"],
+                        int(supersede_expected_version),
+                        next_prior_version,
+                        now,
+                    ),
+                )
+            conn.execute(
+                """INSERT INTO goal_coordinators (
+                       id, profile_name, goal, acceptance_contract_json,
+                       status, version, session_id, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)""",
+                (
+                    goal_id,
+                    profile_name,
+                    goal,
+                    contract_json,
+                    "created",
+                    str(session_id) if session_id else None,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO goal_coordinator_audit (
+                       goal_id, event, from_status, to_status, expected_version,
+                       result_version, accepted, reason, metadata_json, created_at
+                   ) VALUES (?, 'created', NULL, ?, NULL, 1, 1, 'created', '{}', ?)""",
+                (goal_id, "created", now),
+            )
+            if activate_status is not None:
+                allowed = self._GOAL_COORDINATOR_TRANSITIONS["created"]
+                if activate_status not in allowed:
+                    raise ValueError(
+                        f"invalid initial goal coordinator transition: created -> {activate_status}"
+                    )
+                conn.execute(
+                    """UPDATE goal_coordinators
+                       SET status = ?, version = 2, updated_at = ? WHERE id = ?""",
+                    (activate_status, now, goal_id),
+                )
+                conn.execute(
+                    """INSERT INTO goal_coordinator_audit (
+                           goal_id, event, from_status, to_status, expected_version,
+                           result_version, accepted, reason, metadata_json, created_at
+                       ) VALUES (?, 'transition', 'created', ?, 1, 2, 1,
+                                 'activated', '{}', ?)""",
+                    (goal_id, activate_status, now),
+                )
+            if legacy_meta_key is not None and legacy_state_json is not None:
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (legacy_meta_key, legacy_state_json),
+                )
+
+        self._execute_write(_do)
+        record = self.get_goal_coordinator(goal_id)
+        if record is None:  # pragma: no cover - defensive read-after-write guard
+            raise RuntimeError("goal coordinator create succeeded without readback")
+        return record
+
+    def get_goal_coordinator(self, goal_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM goal_coordinators WHERE id = ?", (goal_id,)
+            ).fetchone()
+        return self._goal_coordinator_row(row) if row is not None else None
+
+    def transition_goal_coordinator(
+        self,
+        goal_id: str,
+        *,
+        expected_version: int,
+        new_status: str,
+        reason: str,
+        checkpoint: Optional[Dict[str, Any]] = None,
+        acceptance_contract: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        audit_metadata: Optional[Dict[str, Any]] = None,
+        legacy_meta_key: Optional[str] = None,
+        legacy_state_json: Optional[str] = None,
+        legacy_clear_meta_key: Optional[str] = None,
+        legacy_clear_state_json: Optional[str] = None,
+        clear_resume_metadata: bool = False,
+    ) -> Dict[str, Any]:
+        """CAS-update a goal and append its audit event in one transaction."""
+        if new_status not in self._GOAL_COORDINATOR_STATUSES:
+            raise ValueError(f"unknown goal coordinator status: {new_status}")
+        if int(expected_version) < 1:
+            raise ValueError("expected_version must be positive")
+        reason = str(reason or "").strip()
+        if not reason or len(reason) > 1024:
+            raise ValueError("transition reason is required and must be bounded")
+        self._validate_goal_payload({"reason": reason}, label="transition reason")
+        checkpoint_json = None
+        if checkpoint is not None:
+            checkpoint_json = self._validate_goal_checkpoint(checkpoint)
+        contract_json = None
+        if acceptance_contract is not None:
+            contract_json = self._validate_goal_contract(acceptance_contract)
+        metadata = audit_metadata or {}
+        if not isinstance(metadata, dict):
+            raise ValueError("audit metadata must be an object")
+        unknown_metadata = set(metadata) - self._GOAL_AUDIT_METADATA_FIELDS
+        if unknown_metadata:
+            raise ValueError(
+                f"unsupported audit metadata field: {sorted(unknown_metadata)[0]}"
+            )
+        metadata_json = self._validate_goal_payload(metadata, label="audit metadata")
+        legacy_state_json = self._validate_legacy_goal_state(legacy_state_json)
+        legacy_clear_state_json = self._validate_legacy_goal_state(
+            legacy_clear_state_json
+        )
+        now = time.time()
+
+        def _audit_rejection(conn, row, message):
+            conn.execute(
+                """INSERT INTO goal_coordinator_audit (
+                       goal_id, event, from_status, to_status, expected_version,
+                       result_version, accepted, reason, metadata_json, created_at
+                   ) VALUES (?, 'transition_rejected', ?, ?, ?, ?, 0, ?, ?, ?)""",
+                (
+                    goal_id,
+                    row["status"],
+                    new_status,
+                    int(expected_version),
+                    row["version"],
+                    reason,
+                    metadata_json,
+                    now,
+                ),
+            )
+            return {"error": message}
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM goal_coordinators WHERE id = ?", (goal_id,)
+            ).fetchone()
+            if row is None:
+                return {"error": f"goal coordinator not found: {goal_id}"}
+            if row["version"] != int(expected_version):
+                return _audit_rejection(
+                    conn,
+                    row,
+                    (
+                        "stale goal coordinator version: "
+                        f"expected {expected_version}, current {row['version']}"
+                    ),
+                )
+            allowed = self._GOAL_COORDINATOR_TRANSITIONS.get(row["status"], frozenset())
+            if new_status != row["status"] and new_status not in allowed:
+                return _audit_rejection(
+                    conn,
+                    row,
+                    f"invalid goal coordinator transition: {row['status']} -> {new_status}",
+                )
+            if (
+                session_id
+                and row["session_id"]
+                and str(session_id) != row["session_id"]
+            ):
+                original_session = conn.execute(
+                    "SELECT ended_at FROM sessions WHERE id = ?",
+                    (row["session_id"],),
+                ).fetchone()
+                if (
+                    original_session is not None
+                    and original_session["ended_at"] is None
+                ):
+                    return _audit_rejection(
+                        conn,
+                        row,
+                        "durable goal coordinator original session is still live",
+                    )
+            if session_id and new_status in {
+                "created",
+                "running",
+                "checkpointing",
+                "yielded",
+                "needs_continuation",
+            }:
+                conflicting = conn.execute(
+                    """SELECT id FROM goal_coordinators
+                       WHERE session_id = ? AND id != ?
+                         AND status IN ('created', 'running', 'checkpointing',
+                                        'yielded', 'needs_continuation')
+                       LIMIT 1""",
+                    (str(session_id), goal_id),
+                ).fetchone()
+                if conflicting is not None:
+                    return _audit_rejection(
+                        conn,
+                        row,
+                        "target session already has an active goal coordinator",
+                    )
+
+            next_version = row["version"] + 1
+            checkpoint_data = (
+                checkpoint
+                if checkpoint is not None
+                else self._decode_goal_json(row["checkpoint_json"], {})
+            )
+            milestone = checkpoint_data.get("milestone") if isinstance(checkpoint_data, dict) else None
+            next_action = checkpoint_data.get("next_action") if isinstance(checkpoint_data, dict) else None
+            continuation = (
+                checkpoint_data.get("continuation_summary")
+                if isinstance(checkpoint_data, dict)
+                else None
+            )
+            completed_at = now if new_status in {"completed", "failed", "cancelled"} else None
+            cursor = conn.execute(
+                """UPDATE goal_coordinators
+                   SET status = ?, version = ?,
+                       acceptance_contract_json = COALESCE(?, acceptance_contract_json),
+                       session_id = COALESCE(?, session_id),
+                       current_milestone_json = CASE WHEN ? THEN NULL ELSE COALESCE(?, current_milestone_json) END,
+                       checkpoint_json = CASE WHEN ? THEN NULL ELSE COALESCE(?, checkpoint_json) END,
+                       next_action = CASE WHEN ? THEN NULL ELSE COALESCE(?, next_action) END,
+                       continuation_summary = CASE WHEN ? THEN NULL ELSE COALESCE(?, continuation_summary) END,
+                       updated_at = ?, completed_at = COALESCE(?, completed_at)
+                   WHERE id = ? AND version = ?""",
+                (
+                    new_status,
+                    next_version,
+                    contract_json,
+                    str(session_id) if session_id else None,
+                    bool(clear_resume_metadata),
+                    (
+                        json.dumps(milestone, ensure_ascii=False, separators=(",", ":"))
+                        if milestone is not None
+                        else None
+                    ),
+                    bool(clear_resume_metadata),
+                    checkpoint_json,
+                    bool(clear_resume_metadata),
+                    str(next_action) if next_action is not None else None,
+                    bool(clear_resume_metadata),
+                    str(continuation) if continuation is not None else None,
+                    now,
+                    completed_at,
+                    goal_id,
+                    int(expected_version),
+                ),
+            )
+            if cursor.rowcount != 1:  # pragma: no cover - BEGIN IMMEDIATE serializes writers
+                return _audit_rejection(
+                    conn, row, "stale goal coordinator version during update"
+                )
+            conn.execute(
+                """INSERT INTO goal_coordinator_audit (
+                       goal_id, event, from_status, to_status, expected_version,
+                       result_version, accepted, reason, metadata_json, created_at
+                   ) VALUES (?, 'transition', ?, ?, ?, ?, 1, ?, ?, ?)""",
+                (
+                    goal_id,
+                    row["status"],
+                    new_status,
+                    int(expected_version),
+                    next_version,
+                    reason,
+                    metadata_json,
+                    now,
+                ),
+            )
+            if checkpoint_json is not None:
+                conn.execute(
+                    """INSERT INTO goal_coordinator_checkpoints (
+                           goal_id, version, status, checkpoint_json, created_at
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (goal_id, next_version, new_status, checkpoint_json, now),
+                )
+            if legacy_meta_key is not None and legacy_state_json is not None:
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (legacy_meta_key, legacy_state_json),
+                )
+            if (
+                legacy_clear_meta_key is not None
+                and legacy_clear_state_json is not None
+            ):
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (legacy_clear_meta_key, legacy_clear_state_json),
+                )
+            return {"version": next_version}
+
+        outcome = self._execute_write(_do)
+        if outcome.get("error"):
+            raise RuntimeError(outcome["error"])
+        record = self.get_goal_coordinator(goal_id)
+        if record is None:  # pragma: no cover - defensive read-after-write guard
+            raise RuntimeError("goal coordinator transition succeeded without readback")
+        return record
+
+    def list_goal_coordinator_audit(self, goal_id: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM goal_coordinator_audit WHERE goal_id = ? ORDER BY id",
+                (goal_id,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["accepted"] = bool(item["accepted"])
+            item["metadata"] = self._decode_goal_json(
+                item.pop("metadata_json", None), {}
+            )
+            result.append(item)
+        return result
+
+    def list_goal_coordinator_checkpoints(self, goal_id: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT id, goal_id, version, status, checkpoint_json, created_at
+                   FROM goal_coordinator_checkpoints
+                   WHERE goal_id = ? ORDER BY version""",
+                (goal_id,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["checkpoint"] = self._decode_goal_json(
+                item.pop("checkpoint_json", None), {}
+            )
+            result.append(item)
+        return result
+
+    def get_goal_resume(self, goal_id: str) -> Optional[Dict[str, Any]]:
+        """Return bounded Resume metadata without checkpoint/audit history."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT id, status, version, goal, session_id,
+                          current_milestone_json, next_action,
+                          continuation_summary, updated_at
+                   FROM goal_coordinators WHERE id = ?""",
+                (goal_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["current_milestone"] = self._decode_goal_json(
+            result.pop("current_milestone_json", None), None
+        )
+        return result
+
+    def find_resumable_goal_coordinators(
+        self,
+        profile_name: str,
+        *,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Return compact profile-scoped candidates for an explicit Resume UX."""
+        limit = max(1, min(int(limit), 100))
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT id, status, version, goal, session_id,
+                          current_milestone_json, next_action,
+                          continuation_summary, updated_at
+                   FROM goal_coordinators
+                   WHERE profile_name = ?
+                     AND status IN ('orphaned', 'yielded', 'needs_continuation')
+                   ORDER BY updated_at DESC, id DESC
+                   LIMIT ?""",
+                (str(profile_name), limit),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["current_milestone"] = self._decode_goal_json(
+                item.pop("current_milestone_json", None), None
+            )
+            result.append(item)
+        return result
 
     # ── Meta key/value (for scheduler bookkeeping) ──
 
