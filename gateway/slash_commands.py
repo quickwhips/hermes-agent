@@ -2346,7 +2346,10 @@ class GatewaySlashCommandsMixin:
             return t("gateway.goal.paused", goal=state.goal)
 
         if lower == "resume":
-            state = mgr.resume()
+            try:
+                state = mgr.resume()
+            except RuntimeError as exc:
+                return f"⚠ Goal resume failed: {exc}. Try again after storage is available."
             if state is None:
                 return t("gateway.goal.no_resume")
             return t("gateway.goal.resumed", goal=state.goal)

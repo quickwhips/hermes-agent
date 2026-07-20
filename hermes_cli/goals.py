@@ -33,6 +33,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -395,7 +396,7 @@ class GoalState:
     """Serializable goal state stored per session."""
 
     goal: str
-    status: str = "active"          # active | paused | done | cleared
+    status: str = "active"          # active | paused | needs_continuation | done | cleared
     turns_used: int = 0
     max_turns: int = DEFAULT_MAX_TURNS
     created_at: float = 0.0
@@ -442,6 +443,15 @@ class GoalState:
     # constraints / boundaries / stop_when). Empty by default; a goal with
     # no contract behaves exactly like the original free-form goal.
     contract: GoalContract = field(default_factory=GoalContract)
+    # A max-iteration exit is a durable handoff, not a normal goal verdict.
+    # Keep only small structured metadata: never persist the raw model reply
+    # (which may include a transcript fragment or sensitive tool output).
+    checkpoint_id: Optional[str] = None
+    checkpoint_at: float = 0.0
+    checkpoint_reason: Optional[str] = None
+    checkpoint_budget_used: Optional[int] = None
+    checkpoint_budget_max: Optional[int] = None
+    checkpoint_summary: Optional[str] = None
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -474,6 +484,12 @@ class GoalState:
             waiting_reason=data.get("waiting_reason"),
             waiting_since=float(data.get("waiting_since", 0.0) or 0.0),
             contract=GoalContract.from_dict(data.get("contract")),
+            checkpoint_id=(str(data["checkpoint_id"]) if data.get("checkpoint_id") else None),
+            checkpoint_at=float(data.get("checkpoint_at", 0.0) or 0.0),
+            checkpoint_reason=(str(data["checkpoint_reason"]) if data.get("checkpoint_reason") else None),
+            checkpoint_budget_used=(int(data["checkpoint_budget_used"]) if data.get("checkpoint_budget_used") is not None else None),
+            checkpoint_budget_max=(int(data["checkpoint_budget_max"]) if data.get("checkpoint_budget_max") is not None else None),
+            checkpoint_summary=(str(data["checkpoint_summary"]) if data.get("checkpoint_summary") else None),
         )
 
     # --- contract helpers -------------------------------------------------
@@ -554,17 +570,35 @@ def load_goal(session_id: str) -> Optional[GoalState]:
         return None
 
 
-def save_goal(session_id: str, state: GoalState) -> None:
-    """Persist a goal to SessionDB. No-op if DB unavailable."""
+def save_goal(session_id: str, state: GoalState) -> bool:
+    """Persist a goal to SessionDB and report whether the write succeeded."""
     if not session_id:
-        return
+        return False
     db = _get_session_db()
     if db is None:
-        return
+        return False
     try:
         db.set_meta(_meta_key(session_id), state.to_json())
     except Exception as exc:
         logger.debug("GoalManager: set_meta failed: %s", exc)
+        return False
+    return True
+
+
+def parse_max_iteration_exit_reason(
+    turn_exit_reason: str,
+) -> Optional[Tuple[int, int]]:
+    """Return a validated ``(used, maximum)`` max-iteration receipt."""
+    match = re.fullmatch(
+        r"max_iterations_reached\((\d+)/(\d+)\)",
+        str(turn_exit_reason or ""),
+    )
+    if not match:
+        return None
+    used, maximum = (int(match.group(1)), int(match.group(2)))
+    if maximum <= 0 or used != maximum:
+        return None
+    return used, maximum
 
 
 def clear_goal(session_id: str) -> None:
@@ -601,7 +635,8 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         # lineage that re-established its own goal).
         if load_goal(new_session_id) is not None:
             return False
-        save_goal(new_session_id, state)
+        if not save_goal(new_session_id, state):
+            return False
         # Archive the parent's row so it isn't double-counted as active.
         clear_goal(old_session_id)
         logger.debug(
@@ -1108,7 +1143,7 @@ class GoalManager:
         return self._state is not None and self._state.status == "active"
 
     def has_goal(self) -> bool:
-        return self._state is not None and self._state.status in {"active", "paused"}
+        return self._state is not None and self._state.status in {"active", "paused", "needs_continuation"}
 
     def has_contract(self) -> bool:
         return self._state is not None and self._state.has_contract()
@@ -1136,6 +1171,11 @@ class GoalManager:
         if s.status == "paused":
             extra = f" — {s.paused_reason}" if s.paused_reason else ""
             return f"⏸ Goal (paused, {meta}{extra}): {s.goal}"
+        if s.status == "needs_continuation":
+            budget = ""
+            if s.checkpoint_budget_used is not None and s.checkpoint_budget_max is not None:
+                budget = f", model budget {s.checkpoint_budget_used}/{s.checkpoint_budget_max}"
+            return f"⏭ Goal (needs continuation{budget}, {meta}): {s.goal}"
         if s.status == "done":
             return f"✓ Goal done ({meta}): {s.goal}"
         return f"Goal ({s.status}, {meta}): {s.goal}"
@@ -1187,18 +1227,74 @@ class GoalManager:
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
         if not self._state:
             return None
-        self._state.status = "active"
-        self._state.paused_reason = None
+        candidate = GoalState.from_json(self._state.to_json())
+        candidate.status = "active"
+        candidate.paused_reason = None
         # Resuming starts fresh — clear any stale barrier.
-        self._state.waiting_on_pid = None
-        self._state.waiting_on_session = None
-        self._state.waiting_until = 0.0
-        self._state.waiting_reason = None
-        self._state.waiting_since = 0.0
+        candidate.waiting_on_pid = None
+        candidate.waiting_on_session = None
+        candidate.waiting_until = 0.0
+        candidate.waiting_reason = None
+        candidate.waiting_since = 0.0
+        candidate.checkpoint_id = None
+        candidate.checkpoint_at = 0.0
+        candidate.checkpoint_reason = None
+        candidate.checkpoint_budget_used = None
+        candidate.checkpoint_budget_max = None
+        candidate.checkpoint_summary = None
         if reset_budget:
-            self._state.turns_used = 0
-        save_goal(self.session_id, self._state)
+            candidate.turns_used = 0
+        if not save_goal(self.session_id, candidate):
+            raise RuntimeError("could not persist resumed goal")
+        self._state = candidate
         return self._state
+
+    def checkpoint_after_max_iterations(self, turn_exit_reason: str) -> Dict[str, Any]:
+        """Persist a compact, transcript-free handoff for a capped model turn.
+
+        The model response is deliberately not accepted: it can contain tool
+        output, secrets, or an arbitrary transcript slice. The live session
+        history remains the source for a user-initiated resume. A caller may
+        emit ``goal.checkpointed`` only when this method returns a non-empty
+        receipt, which happens after the persistence write succeeds.
+        """
+        if self._state is None or self._state.status != "active":
+            return {}
+        parsed_budget = parse_max_iteration_exit_reason(turn_exit_reason)
+        if parsed_budget is None:
+            return {}
+        used, maximum = parsed_budget
+
+        previous = {
+            "status": self._state.status,
+            "checkpoint_id": self._state.checkpoint_id,
+            "checkpoint_at": self._state.checkpoint_at,
+            "checkpoint_reason": self._state.checkpoint_reason,
+            "checkpoint_budget_used": self._state.checkpoint_budget_used,
+            "checkpoint_budget_max": self._state.checkpoint_budget_max,
+            "checkpoint_summary": self._state.checkpoint_summary,
+        }
+        checkpoint_at = time.time()
+        summary = "Model turn reached its iteration limit; resume from the current session context."
+        self._state.status = "needs_continuation"
+        self._state.checkpoint_id = uuid.uuid4().hex
+        self._state.checkpoint_at = checkpoint_at
+        self._state.checkpoint_reason = "max_iterations_reached"
+        self._state.checkpoint_budget_used = used
+        self._state.checkpoint_budget_max = maximum
+        self._state.checkpoint_summary = summary[:240]
+        if not save_goal(self.session_id, self._state):
+            for key, value in previous.items():
+                setattr(self._state, key, value)
+            return {}
+        return {
+            "id": self._state.checkpoint_id,
+            "at": checkpoint_at,
+            "reason": self._state.checkpoint_reason,
+            "budget_used": used,
+            "budget_max": maximum,
+            "summary": self._state.checkpoint_summary,
+        }
 
     def clear(self) -> None:
         if self._state is None:

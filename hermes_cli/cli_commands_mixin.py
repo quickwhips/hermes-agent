@@ -2085,7 +2085,14 @@ class CLICommandsMixin:
             return
 
         if lower == "resume":
-            state = mgr.resume()
+            try:
+                state = mgr.resume()
+            except RuntimeError as exc:
+                _cprint(
+                    f"  ⚠ Goal resume failed: {exc}. "
+                    "Try again after storage is available."
+                )
+                return
             if state is None:
                 _cprint(f"  {_DIM}No goal to resume.{_RST}")
             else:

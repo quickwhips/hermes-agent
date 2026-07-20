@@ -180,6 +180,27 @@ describe('createGatewayEventHandler', () => {
     expect(getUiState().status).toBe('⏸ goal paused')
   })
 
+  it('surfaces a durable goal checkpoint as needs continuation', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({
+      payload: {
+        budget_max: 3,
+        budget_used: 3,
+        checkpoint_at: 1,
+        checkpoint_id: 'checkpoint-1',
+        goal_session_id: 'goal-session-1',
+        reason: 'max_iterations_reached',
+        status: 'needs_continuation',
+        summary: 'Model turn reached its iteration limit.'
+      },
+      type: 'goal.checkpointed'
+    })
+
+    expect(getUiState().status).toBe('⏭ goal needs continuation')
+  })
+
   it('surfaces self-improvement review summaries as a persistent system line', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)

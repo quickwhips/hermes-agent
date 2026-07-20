@@ -11416,14 +11416,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # broken judge never breaks normal message handling.
             try:
                 _final_text = ""
+                _turn_exit_reason = ""
                 if isinstance(_agent_result, dict):
                     _final_text = str(_agent_result.get("final_response") or "")
+                    _turn_exit_reason = str(
+                        _agent_result.get("turn_exit_reason") or ""
+                    )
                 elif isinstance(_agent_result, str):
                     _final_text = _agent_result
-                # Skip for empty responses (interrupted / errored) — the
-                # judge would almost always say "continue" and we'd loop
-                # on error. Let the user drive the next turn.
-                if _final_text.strip():
+                # Skip ordinary empty responses (interrupted / errored), but
+                # never skip a max-iteration boundary: that exit still needs
+                # a durable checkpoint even when it has no visible text.
+                if self._should_post_turn_goal_continuation(
+                    _final_text, _turn_exit_reason
+                ):
                     try:
                         session_entry = await self.async_session_store.get_or_create_session(source)
                     except Exception:
@@ -11433,6 +11439,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
+                            turn_exit_reason=_turn_exit_reason,
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
@@ -14125,12 +14132,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await _deliver()
 
+    @staticmethod
+    def _is_max_iteration_exit_reason(turn_exit_reason: str) -> bool:
+        from hermes_cli.goals import parse_max_iteration_exit_reason
+
+        return parse_max_iteration_exit_reason(turn_exit_reason) is not None
+
+    @staticmethod
+    def _should_post_turn_goal_continuation(
+        final_response: str, turn_exit_reason: str
+    ) -> bool:
+        """Run the goal hook for visible replies or durable handoff exits."""
+        return bool(
+            (final_response or "").strip()
+            or GatewayRunner._is_max_iteration_exit_reason(turn_exit_reason)
+        )
+
     async def _post_turn_goal_continuation(
         self,
         *,
         session_entry: Any,
         source: Any,
         final_response: str,
+        turn_exit_reason: str = "",
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -14156,6 +14180,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
         if not mgr.is_active():
+            return
+
+        if self._is_max_iteration_exit_reason(turn_exit_reason):
+            checkpoint = mgr.checkpoint_after_max_iterations(turn_exit_reason)
+            if checkpoint:
+                msg = (
+                    "⏭ Goal checkpointed — model iteration budget "
+                    f"{checkpoint['budget_used']}/{checkpoint['budget_max']} "
+                    "was exhausted. Use /goal resume to continue."
+                )
+            else:
+                msg = (
+                    "⚠ Goal continuation checkpoint could not be persisted. "
+                    "Automatic continuation was stopped; use /goal status after "
+                    "storage is available."
+                )
+            if source is not None:
+                await self._defer_goal_status_notice_after_delivery(source, msg)
             return
 
         try:

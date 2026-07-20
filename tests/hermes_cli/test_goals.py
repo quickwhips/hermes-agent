@@ -640,6 +640,30 @@ class TestMigrateGoalToSession:
         assert migrate_goal_to_session("p4", "c4") is False
         assert load_goal("c4") is None
 
+    def test_failed_child_save_preserves_parent(self, hermes_home, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalState, load_goal, migrate_goal_to_session, save_goal
+
+        assert save_goal("parent-save-failure", GoalState(goal="keep this checkpoint"))
+        real_save_goal = goals.save_goal
+
+        def fail_child_save(session_id, state):
+            if session_id == "child-save-failure":
+                return False
+            return real_save_goal(session_id, state)
+
+        monkeypatch.setattr(goals, "save_goal", fail_child_save)
+
+        assert migrate_goal_to_session(
+            "parent-save-failure",
+            "child-save-failure",
+            reason="compression",
+        ) is False
+        parent = load_goal("parent-save-failure")
+        assert parent is not None
+        assert parent.status == "active"
+        assert load_goal("child-save-failure") is None
+
 
 class TestGoalManagerSubgoals:
     def test_add_subgoal(self, hermes_home):
@@ -1524,3 +1548,127 @@ class TestContractAndBackgroundCompose:
             )
         assert verdict == "done"
         assert wait_directive is None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Max-iteration checkpoint — durable handoff, not a judge/follow-up
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestMaxIterationCheckpoint:
+    def test_checkpoint_persists_bounded_metadata_and_reloads(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="checkpoint-persist")
+        mgr.set("ship the feature", max_turns=9)
+        checkpoint = mgr.checkpoint_after_max_iterations(
+            "max_iterations_reached(7/7)",
+        )
+
+        assert mgr.state.status == "needs_continuation"
+        assert checkpoint["reason"] == "max_iterations_reached"
+        assert checkpoint["budget_used"] == 7
+        assert checkpoint["budget_max"] == 7
+        assert checkpoint["id"]
+        assert checkpoint["at"] > 0
+        assert len(checkpoint["summary"]) <= 240
+        assert "model reply" not in mgr.state.to_json()
+
+        reloaded = GoalManager(session_id="checkpoint-persist").state
+        assert reloaded is not None
+        assert reloaded.status == "needs_continuation"
+        assert reloaded.checkpoint_id == checkpoint["id"]
+        assert reloaded.checkpoint_budget_used == 7
+        assert reloaded.checkpoint_budget_max == 7
+        assert reloaded.checkpoint_summary == checkpoint["summary"]
+        assert "needs continuation" in GoalManager(session_id="checkpoint-persist").status_line().lower()
+
+    def test_old_state_json_loads_without_checkpoint_metadata(self):
+        from hermes_cli.goals import GoalState
+
+        state = GoalState.from_json('{"goal":"legacy","status":"active"}')
+        assert state.checkpoint_id is None
+        assert state.checkpoint_at == 0.0
+        assert state.checkpoint_budget_used is None
+        assert state.checkpoint_budget_max is None
+        assert state.checkpoint_summary is None
+
+    def test_resume_reactivates_and_clears_checkpoint_metadata(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="checkpoint-resume")
+        mgr.set("finish it")
+        mgr.checkpoint_after_max_iterations("max_iterations_reached(2/2)")
+        resumed = mgr.resume()
+
+        assert resumed.status == "active"
+        assert resumed.checkpoint_id is None
+        assert resumed.checkpoint_at == 0.0
+        assert resumed.checkpoint_budget_used is None
+        assert resumed.checkpoint_budget_max is None
+        assert resumed.checkpoint_summary is None
+
+    def test_resume_rolls_back_when_persistence_fails(self, hermes_home, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="checkpoint-resume-write-failure")
+        mgr.set("finish it")
+        checkpoint = mgr.checkpoint_after_max_iterations(
+            "max_iterations_reached(2/2)"
+        )
+        assert checkpoint
+
+        observed = {}
+
+        def fail_save(_session_id, candidate):
+            observed["manager_status_during_write"] = mgr.state.status
+            observed["candidate_status"] = candidate.status
+            return False
+
+        monkeypatch.setattr(goals, "save_goal", fail_save)
+
+        with pytest.raises(RuntimeError, match="persist resumed goal"):
+            mgr.resume()
+
+        assert mgr.state.status == "needs_continuation"
+        assert mgr.state.checkpoint_id == checkpoint["id"]
+        assert observed == {
+            "manager_status_during_write": "needs_continuation",
+            "candidate_status": "active",
+        }
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "max_iterations_reached(3/3) trailing-data",
+            "max_iterations_reached(4/3)",
+            "max_iterations_reached(2/3)",
+            "max_iterations_reached(0/0)",
+            "error_near_max_iterations(boom)",
+        ],
+    )
+    def test_checkpoint_rejects_invalid_or_noncanonical_exit_reason(
+        self, hermes_home, reason
+    ):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="checkpoint-invalid")
+        mgr.set("finish it")
+
+        assert mgr.checkpoint_after_max_iterations(reason) == {}
+        assert mgr.state.status == "active"
+
+    def test_checkpoint_does_not_claim_success_when_persistence_fails(
+        self, hermes_home, monkeypatch
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="checkpoint-write-failure")
+        mgr.set("finish it")
+        monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
+
+        assert mgr.checkpoint_after_max_iterations("max_iterations_reached(2/2)") == {}
+        assert mgr.state.status == "active"
+        assert mgr.state.checkpoint_id is None

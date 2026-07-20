@@ -33,7 +33,7 @@ What you'll see:
 2. **Turn 1 runs** — Hermes starts working as if you'd sent the goal as a normal message.
 3. **Judge runs** — after the turn, the judge model decides `done` or `continue`.
 4. **Loop fires if needed** — if `continue`, you'll see `↻ Continuing toward goal (1/20): <judge's reason>` and Hermes takes the next step automatically.
-5. **Terminates** — eventually you see either `✓ Goal achieved: <reason>` or `⏸ Goal paused — N/20 turns used`.
+5. **Yields or terminates** — eventually you see `✓ Goal achieved: <reason>`, `⏸ Goal paused — N/20 turns used`, or a continuation checkpoint when one model turn reaches its iteration limit.
 
 ## Commands
 
@@ -44,12 +44,16 @@ What you'll see:
 | `/goal show` | Print the active goal's completion contract. |
 | `/goal` or `/goal status` | Show the current goal, its status, and turns used. |
 | `/goal pause` | Stop the auto-continuation loop without clearing the goal. |
-| `/goal resume` | Resume the loop (resets the turn counter back to zero). |
+| `/goal resume` | Resume a paused or checkpointed loop (resets the turn counter back to zero). |
 | `/goal clear` | Drop the goal entirely. |
 | `/goal wait <pid> [reason]` | Park the loop on a background process — it stops re-poking the agent every turn while the process runs, and auto-resumes when it exits. |
 | `/goal unwait` | Drop the wait barrier and resume the loop immediately. |
 
 Works identically on the CLI and every gateway platform (Telegram, Discord, Slack, Matrix, Signal, WhatsApp, SMS, iMessage, Webhook, API server, and the web dashboard).
+
+### Model iteration checkpoints
+
+The goal turn budget and the model's per-turn iteration limit are separate. If a model turn reaches its own iteration limit first, Hermes records a compact, transcript-free checkpoint, marks the goal as **needs continuation**, and stops automatic follow-up for that turn. The gateway remains available and shows an explicit prompt to run `/goal resume`; resuming clears the checkpoint and starts with a fresh goal-turn budget.
 
 ## Completion contracts
 

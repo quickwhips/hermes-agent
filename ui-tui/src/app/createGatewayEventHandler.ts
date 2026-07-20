@@ -459,6 +459,12 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         turnController.startMessage()
 
         return
+
+      case 'goal.checkpointed':
+        setStatus('⏭ goal needs continuation')
+        restoreStatusAfter(6000)
+
+        return
       case 'status.update': {
         const p = ev.payload
 
@@ -473,6 +479,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             ? '✓ goal complete'
             : p.text.startsWith('↻')
               ? '↻ goal continuing'
+              : p.text.startsWith('⏭')
+                ? '⏭ goal needs continuation'
               : p.text.startsWith('⏸')
                 ? '⏸ goal paused'
                 : 'ready'

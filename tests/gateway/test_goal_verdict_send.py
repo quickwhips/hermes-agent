@@ -96,6 +96,27 @@ def _make_runner_with_adapter(session_id: str = None):
     return runner, adapter, session_entry, src
 
 
+def test_goal_hook_runs_for_empty_max_iteration_result():
+    runner, _adapter, _session_entry, _src = _make_runner_with_adapter()
+
+    assert runner._should_post_turn_goal_continuation(
+        "", "max_iterations_reached(3/3)"
+    )
+    assert not runner._should_post_turn_goal_continuation("", "")
+    assert not runner._should_post_turn_goal_continuation(
+        "", "max_iterations_reached(3/3) trailing-data"
+    )
+    assert not runner._should_post_turn_goal_continuation(
+        "", "max_iterations_reached(4/3)"
+    )
+    assert not runner._should_post_turn_goal_continuation(
+        "", "max_iterations_reached(2/3)"
+    )
+    assert not runner._should_post_turn_goal_continuation(
+        "", "max_iterations_reached(0/0)"
+    )
+
+
 @pytest.mark.asyncio
 async def test_goal_verdict_done_sent_via_adapter_send(hermes_home):
     """When the judge says done, the '✓ Goal achieved' message must reach
@@ -149,6 +170,60 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
     assert "Continuing toward goal" in adapter.sends[0]["content"]
     # Continuation prompt enqueued for next turn
     assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
+
+
+@pytest.mark.asyncio
+async def test_goal_max_iterations_checkpoints_without_judge_or_continuation(
+    hermes_home,
+):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("finish the bounded task")
+
+    with patch("hermes_cli.goals.judge_goal") as judge:
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="",
+            turn_exit_reason="max_iterations_reached(3/3)",
+        )
+        await asyncio.sleep(0.05)
+
+    state = GoalManager(session_entry.session_id).state
+    assert state.status == "needs_continuation"
+    assert state.checkpoint_reason == "max_iterations_reached"
+    assert judge.call_count == 0
+    assert not adapter._pending_messages
+    assert len(adapter.sends) == 1
+    assert "checkpointed" in adapter.sends[0]["content"].lower()
+    assert "/goal resume" in adapter.sends[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_max_iteration_reason_with_visible_reply_uses_normal_judge(
+    hermes_home,
+):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("finish the bounded task")
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("done", "done", False, None, False),
+    ):
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="visible result",
+            turn_exit_reason="max_iterations_reached(4/3)",
+        )
+        await asyncio.sleep(0.05)
+
+    assert GoalManager(session_entry.session_id).state.status == "done"
+    assert "achieved" in adapter.sends[0]["content"].lower()
 
 
 @pytest.mark.asyncio

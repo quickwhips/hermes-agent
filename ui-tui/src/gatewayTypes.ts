@@ -539,6 +539,17 @@ export interface SpawnTreeLoadResponse {
   subagents?: unknown[]
 }
 
+export interface GoalCheckpointedPayload {
+  budget_max: number
+  budget_used: number
+  checkpoint_at: number
+  checkpoint_id: string
+  goal_session_id: string
+  reason: 'max_iterations_reached'
+  status: 'needs_continuation'
+  summary: string
+}
+
 export type GatewayEvent =
   | { payload?: { skin?: GatewaySkin }; session_id?: string; type: 'gateway.ready' }
   | { payload?: GatewaySkin; session_id?: string; type: 'skin.changed' }
@@ -560,6 +571,7 @@ export type GatewayEvent =
       type: 'notification.show'
     }
   | { payload?: { key?: string }; session_id?: string; type: 'notification.clear' }
+  | { payload: GoalCheckpointedPayload; session_id?: string; type: 'goal.checkpointed' }
   | {
       payload: { user_code?: string; verification_url: string }
       session_id?: string

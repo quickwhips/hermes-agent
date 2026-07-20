@@ -58,9 +58,9 @@ def server(hermes_home):
 
 
 @pytest.fixture()
-def session(server):
+def session(server, request):
     sid = "sid-test"
-    session_key = "tui-goal-session-1"
+    session_key = f"tui-goal-{request.node.name}"
     s = {
         "session_key": session_key,
         "history": [],
@@ -202,6 +202,199 @@ def test_pending_input_commands_includes_goal(server):
     """Guard: _PENDING_INPUT_COMMANDS must list 'goal' — removing it would
     silently re-break the TUI."""
     assert "goal" in server._PENDING_INPUT_COMMANDS
+
+
+def test_goal_max_iterations_checkpoints_once_without_judging_or_followup(server, session, monkeypatch):
+    """A model iteration cap is a durable handoff, not a normal goal verdict.
+
+    Exercise the real prompt thread so the checkpoint event, no-judge rule,
+    lack of recursive follow-up, and released reusable session are one
+    behavioral contract rather than implementation-detail assertions.
+    """
+    sid, session_key, live = session
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_key).set("finish the bounded task", max_turns=1)
+    judge = MagicMock(return_value=("continue", "should not run", False, None, False))
+    monkeypatch.setattr(goals, "judge_goal", judge)
+
+    class Agent:
+        model = "test-model"
+        provider = "test"
+        base_url = ""
+        api_key = ""
+        api_mode = ""
+        interim_assistant_callback = None
+
+        def clear_interrupt(self):
+            pass
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {
+                "final_response": "",
+                "messages": [],
+                "turn_exit_reason": "max_iterations_reached(3/3)",
+            }
+
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda event, event_sid, payload=None: emitted.append((event, event_sid, payload)))
+    monkeypatch.setattr(server, "_set_session_context", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_session_cwd", lambda *_args, **_kwargs: ".")
+    monkeypatch.setattr(server, "make_stream_renderer", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_get_usage", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"goals": {"max_turns": 20}})
+    monkeypatch.setattr(server, "_load_interim_assistant_messages", lambda: False)
+    monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
+
+    live.update(agent=Agent(), session_key=session_key, running=True)
+    server._run_prompt_submit("checkpoint-rid", sid, live, "start")
+    live["_run_thread"].join(timeout=10)
+
+    assert not live["_run_thread"].is_alive()
+    assert live["running"] is False
+    assert judge.call_count == 0
+    assert GoalManager(session_key).state.status == "needs_continuation"
+    checkpoints = [event for event in emitted if event[0] == "goal.checkpointed"]
+    assert len(checkpoints) == 1
+    assert checkpoints[0][2] == {
+        "checkpoint_id": GoalManager(session_key).state.checkpoint_id,
+        "checkpoint_at": GoalManager(session_key).state.checkpoint_at,
+        "goal_session_id": session_key,
+        "status": "needs_continuation",
+        "reason": "max_iterations_reached",
+        "budget_used": 3,
+        "budget_max": 3,
+        "summary": GoalManager(session_key).state.checkpoint_summary,
+    }
+    status_updates = [
+        event for event in emitted
+        if event[0] == "status.update" and event[2].get("kind") == "goal"
+    ]
+    assert len(status_updates) == 1
+    assert "Use /goal resume" in status_updates[0][2]["text"]
+    assert not any(event[0] == "message.start" for event in emitted[1:])
+
+    resume = _call(
+        server,
+        "command.dispatch",
+        name="goal",
+        arg="resume",
+        session_id=sid,
+    )
+    assert resume["result"]["type"] == "exec"
+    assert "resumed" in resume["result"]["output"].lower()
+    resumed = GoalManager(session_key).state
+    assert resumed.status == "active"
+    assert resumed.checkpoint_id is None
+
+
+def test_non_goal_max_iterations_keeps_session_reusable(server, session, monkeypatch):
+    """Without /goal, an iteration cap remains an ordinary completed TUI turn."""
+    sid, _, live = session
+
+    class Agent:
+        model = "test-model"
+        provider = "test"
+        base_url = ""
+        api_key = ""
+        api_mode = ""
+        interim_assistant_callback = None
+
+        def clear_interrupt(self):
+            pass
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "partial", "messages": [], "turn_exit_reason": "max_iterations_reached(1/1)"}
+
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda event, event_sid, payload=None: emitted.append((event, event_sid, payload)))
+    monkeypatch.setattr(server, "_set_session_context", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_session_cwd", lambda *_args, **_kwargs: ".")
+    monkeypatch.setattr(server, "make_stream_renderer", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_get_usage", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(server, "_load_interim_assistant_messages", lambda: False)
+    monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
+
+    live.update(agent=Agent(), running=True)
+    server._run_prompt_submit("non-goal-rid", sid, live, "start")
+    live["_run_thread"].join(timeout=10)
+
+    assert not live["_run_thread"].is_alive()
+    assert live["running"] is False
+    assert not any(event[0] == "goal.checkpointed" for event in emitted)
+
+
+def test_goal_checkpoint_persistence_failure_is_visible_and_stops_fallthrough(
+    server, monkeypatch
+):
+    class FailingGoalManager:
+        def checkpoint_after_max_iterations(self, _reason):
+            return {}
+
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, event_sid, payload=None: emitted.append(
+            (event, event_sid, payload)
+        ),
+    )
+
+    handled = server._checkpoint_goal_after_max_iterations(
+        FailingGoalManager(),
+        sid="browser-session",
+        goal_session_id="durable-session",
+        turn_exit_reason="max_iterations_reached(3/3)",
+    )
+
+    assert handled is True
+    assert not any(event[0] == "goal.checkpointed" for event in emitted)
+    assert emitted == [
+        (
+            "status.update",
+            "browser-session",
+            {
+                "kind": "goal",
+                "text": (
+                    "⚠ Goal continuation checkpoint could not be persisted. "
+                    "Automatic continuation was stopped; use /goal status after "
+                    "storage is available."
+                ),
+            },
+        )
+    ]
+
+    emitted.clear()
+    assert not server._checkpoint_goal_after_max_iterations(
+        FailingGoalManager(),
+        sid="browser-session",
+        goal_session_id="durable-session",
+        turn_exit_reason="max_iterations_reached(3/3) trailing-data",
+    )
+    assert emitted == []
+
+    for reason in (
+        "max_iterations_reached(4/3)",
+        "max_iterations_reached(0/0)",
+    ):
+        assert not server._checkpoint_goal_after_max_iterations(
+            FailingGoalManager(),
+            sid="browser-session",
+            goal_session_id="durable-session",
+            turn_exit_reason=reason,
+        )
+    assert emitted == []
 
 
 # ── command.dispatch /moa ────────────────────────────────────────────

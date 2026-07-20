@@ -9911,6 +9911,73 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
+def _is_max_iteration_exit_reason(turn_exit_reason: str) -> bool:
+    from hermes_cli.goals import parse_max_iteration_exit_reason
+
+    return parse_max_iteration_exit_reason(turn_exit_reason) is not None
+
+
+def _checkpoint_goal_after_max_iterations(
+    goal_mgr: Any,
+    *,
+    sid: str,
+    goal_session_id: str,
+    turn_exit_reason: str,
+) -> bool:
+    """Handle a capped goal turn without running the normal goal judge.
+
+    Returns ``True`` whenever the exit reason is a max-iteration boundary,
+    including when durable persistence fails. That failure is visible and
+    deliberately does not fall through to automatic continuation.
+    """
+    if not _is_max_iteration_exit_reason(turn_exit_reason):
+        return False
+
+    checkpoint = goal_mgr.checkpoint_after_max_iterations(turn_exit_reason)
+    if not checkpoint:
+        _emit(
+            "status.update",
+            sid,
+            {
+                "kind": "goal",
+                "text": (
+                    "⚠ Goal continuation checkpoint could not be persisted. "
+                    "Automatic continuation was stopped; use /goal status after "
+                    "storage is available."
+                ),
+            },
+        )
+        return True
+
+    _emit(
+        "goal.checkpointed",
+        sid,
+        {
+            "checkpoint_id": checkpoint["id"],
+            "checkpoint_at": checkpoint["at"],
+            "goal_session_id": goal_session_id,
+            "status": "needs_continuation",
+            "reason": checkpoint["reason"],
+            "budget_used": checkpoint["budget_used"],
+            "budget_max": checkpoint["budget_max"],
+            "summary": checkpoint["summary"],
+        },
+    )
+    _emit(
+        "status.update",
+        sid,
+        {
+            "kind": "goal",
+            "text": (
+                "⏭ Goal checkpointed — model iteration budget "
+                f"{checkpoint['budget_used']}/{checkpoint['budget_max']} "
+                "was exhausted. Use /goal resume to continue."
+            ),
+        },
+    )
+    return True
+
+
 def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
     with session["history_lock"]:
         history = list(session["history"])
@@ -10216,7 +10283,15 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # ("✓ Goal achieved" / "⏸ budget exhausted") is surfaced as
             # a system line so the user sees progress regardless of
             # outcome. Mirrors gateway/run._post_turn_goal_continuation.
-            if status == "complete" and isinstance(raw, str) and raw.strip():
+            turn_exit_reason = (
+                str(result.get("turn_exit_reason") or "")
+                if isinstance(result, dict)
+                else ""
+            )
+            if status == "complete" and (
+                (isinstance(raw, str) and raw.strip())
+                or _is_max_iteration_exit_reason(turn_exit_reason)
+            ):
                 try:
                     from hermes_cli.goals import GoalManager
 
@@ -10232,27 +10307,33 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                             default_max_turns=goal_max_turns,
                         )
                         if goal_mgr.is_active():
-                            try:
-                                from hermes_cli.goals import gather_background_processes as _gather_bg
-                                _bg_procs = _gather_bg()
-                            except Exception:
-                                _bg_procs = None
-                            decision = goal_mgr.evaluate_after_turn(
-                                raw,
-                                user_initiated=True,
-                                background_processes=_bg_procs,
-                            )
-                            verdict_msg = decision.get("message") or ""
-                            if verdict_msg:
-                                _emit(
-                                    "status.update",
-                                    sid,
-                                    {"kind": "goal", "text": verdict_msg},
+                            if not _checkpoint_goal_after_max_iterations(
+                                goal_mgr,
+                                sid=sid,
+                                goal_session_id=sid_key,
+                                turn_exit_reason=turn_exit_reason,
+                            ):
+                                try:
+                                    from hermes_cli.goals import gather_background_processes as _gather_bg
+                                    _bg_procs = _gather_bg()
+                                except Exception:
+                                    _bg_procs = None
+                                decision = goal_mgr.evaluate_after_turn(
+                                    raw,
+                                    user_initiated=True,
+                                    background_processes=_bg_procs,
                                 )
-                            if decision.get("should_continue"):
-                                cont_prompt = decision.get("continuation_prompt") or ""
-                                if cont_prompt:
-                                    goal_followup = cont_prompt
+                                verdict_msg = decision.get("message") or ""
+                                if verdict_msg:
+                                    _emit(
+                                        "status.update",
+                                        sid,
+                                        {"kind": "goal", "text": verdict_msg},
+                                    )
+                                if decision.get("should_continue"):
+                                    cont_prompt = decision.get("continuation_prompt") or ""
+                                    if cont_prompt:
+                                        goal_followup = cont_prompt
                 except Exception as _goal_exc:
                     print(
                         f"[tui_gateway] goal continuation hook failed: "
@@ -13284,7 +13365,10 @@ def _(rid, params: dict) -> dict:
             out = "No goal set." if state is None else f"⏸ Goal paused: {state.goal}"
             return _ok(rid, {"type": "exec", "output": out})
         if lower == "resume":
-            state = mgr.resume()
+            try:
+                state = mgr.resume()
+            except RuntimeError as exc:
+                return _err(rid, 4004, f"goal resume failed: {exc}")
             if state is None:
                 return _ok(rid, {"type": "exec", "output": "No goal to resume."})
             return _ok(
