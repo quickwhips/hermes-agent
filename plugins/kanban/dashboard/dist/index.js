@@ -598,6 +598,7 @@
           // deleted in the CLI while dashboard was open), fall back to
           // default so the UI doesn't hang on a 404.
           if (board && board !== "default" && !boards.find(function (b) { return b.slug === board; })) {
+            setSelectedTaskId(null);
             setBoard("default");
             writeSelectedBoard("default");
           }
@@ -943,6 +944,9 @@
     // --- board switching ----------------------------------------------------
     const switchBoard = useCallback(function (nextSlug) {
       if (!nextSlug || nextSlug === board) return;
+      // Task identity is board-scoped. Clear it in the same batched update as
+      // the board change so TaskDrawer never renders the old id with new slug.
+      setSelectedTaskId(null);
       // Optimistic UI: clear the current grid + show loading, reset the
       // event cursor so the WS reopens aligned to the new board's
       // latest_event_id on the next loadBoard.
@@ -3158,12 +3162,33 @@
     const [homeChannels, setHomeChannels] = useState([]);
     const [homeBusy, setHomeBusy] = useState({});
     const boardSlug = props.boardSlug;
+    const loadGenerationRef = useRef(0);
+    const loadIdentityRef = useRef(null);
+    const loadIdentity = `${boardSlug || ""}:${props.taskId}`;
+    if (loadIdentityRef.current !== loadIdentity) {
+      loadIdentityRef.current = loadIdentity;
+      loadGenerationRef.current += 1;
+    }
 
     const load = useCallback(function () {
+      const generation = ++loadGenerationRef.current;
+      setData(null);
+      setErr(null);
+      setPatchErr(null);
+      setLoading(true);
       return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug))
-        .then(function (d) { setData(d); setErr(null); setPatchErr(null); })
-        .catch(function (e) { setErr(String(e.message || e)); })
-        .finally(function () { setLoading(false); });
+        .then(function (d) {
+          if (generation !== loadGenerationRef.current) return;
+          setData(d);
+        })
+        .catch(function (e) {
+          if (generation !== loadGenerationRef.current) return;
+          setErr(String(e.message || e));
+        })
+        .finally(function () {
+          if (generation !== loadGenerationRef.current) return;
+          setLoading(false);
+        });
     }, [props.taskId, boardSlug]);
 
     const loadHomeChannels = useCallback(function () {
