@@ -1331,6 +1331,7 @@ _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
+DEFAULT_READ_BUSY_TIMEOUT_MS = 1_000
 
 # Maximum number of ``<db>.corrupt.<hash>.bak`` quarantine files retained per
 # board DB. Content-addressing already dedupes identical corrupt bytes, but
@@ -2202,6 +2203,45 @@ def connect(
             conn.close()
             raise
     return conn
+
+
+def connect_readonly(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> sqlite3.Connection:
+    """Open an existing Kanban DB without initialization or write side effects.
+
+    This is the steady-state read boundary for polling/dashboard callers. It
+    deliberately does not create parent directories, run schema migrations,
+    switch journal mode, or populate ``_INITIALIZED_PATHS``. The SQLite URI's
+    ``mode=ro`` and connection-local ``query_only`` pragma provide independent
+    fail-closed guards against accidental writes.
+    """
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(resolved)
+
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    conn = connect_tracked(
+        f"{resolved.as_uri()}?mode=ro",
+        tracking_path=resolved,
+        connect_fn=sqlite3.connect,
+        uri=True,
+        isolation_level=None,
+        timeout=DEFAULT_READ_BUSY_TIMEOUT_MS / 1000.0,
+    )
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={DEFAULT_READ_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+    except Exception:
+        conn.close()
+        raise
 
 
 @contextlib.contextmanager
