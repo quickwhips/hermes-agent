@@ -154,6 +154,28 @@ def test_board_switch_closes_task_drawer_before_changing_board_identity():
     )
 
 
+def test_board_switch_disposes_only_its_websocket_generation():
+    """A stale socket callback must not reopen the board it belonged to."""
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    effect_start = bundle.index("// --- WebSocket")
+    effect_end = bundle.index("// --- filtering", effect_start)
+    effect = bundle[effect_start:effect_end]
+
+    assert "let disposed = false;" in effect
+    assert "let retryTimer = null;" in effect
+    assert effect.count("if (disposed) return;") >= 4
+    assert effect.index("disposed = true;") < effect.index("clearTimeout(retryTimer);")
+    assert "wsClosedRef" not in bundle
+
+
 def test_task_drawer_ignores_stale_detail_responses_after_identity_change():
     """A late board-A response must not restore data/error state in board B."""
     bundle = (
