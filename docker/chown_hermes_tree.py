@@ -74,11 +74,12 @@ def repair_tree(
             _repair_entry(name, entry_stat, uid, gid, dir_fd=directory_fd)
 
         for name in files:
+            full_path = os.path.join(directory, name)
             try:
                 entry_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except FileNotFoundError:
                 continue
-            if entry_stat.st_dev != root_device:
+            if full_path in nested_mounts or entry_stat.st_dev != root_device:
                 continue
             _repair_entry(name, entry_stat, uid, gid, dir_fd=directory_fd)
 

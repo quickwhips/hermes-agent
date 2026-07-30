@@ -1,6 +1,7 @@
 """Regression tests for symlink-safe Docker stage2 ownership repair."""
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -23,6 +24,12 @@ def _chown_hermes_tree_function(text: str) -> str:
     start = text.index("path_has_symlink_component() {")
     end = text.index("\n\nneeds_chown=false", start)
     return text[start:end]
+
+
+def _managed_tree_needs_chown_function(text: str) -> str:
+    match = re.search(r"(managed_tree_needs_chown\(\) \{.*?\n\})", text, re.DOTALL)
+    assert match is not None, "managed_tree_needs_chown helper missing"
+    return match.group(1)
 
 
 def _run_helper(
@@ -85,6 +92,27 @@ def test_chown_helper_is_fail_soft_when_python_helper_fails(
     assert proc.returncode == 0, proc.stderr
     assert "chown" in proc.stdout
     assert "continuing" in proc.stdout
+
+
+def test_gid_only_drift_activates_managed_tree_repair(
+    stage2_text: str, tmp_path: Path
+) -> None:
+    shell = shutil.which("sh")
+    if shell is None:
+        pytest.skip("sh not available")
+    target = tmp_path / "home"
+    target.mkdir()
+    script = (
+        "set -eu\n"
+        f"actual_hermes_uid={os.getuid()}\n"
+        f"actual_hermes_gid={os.getgid() + 1}\n"
+        f"{_managed_tree_needs_chown_function(stage2_text)}\n"
+        f'managed_tree_needs_chown "{target}"\n'
+    )
+
+    proc = subprocess.run([shell, "-c", script], capture_output=True, text=True)
+
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_chown_helper_refuses_symlinked_directories(stage2_text: str, tmp_path: Path) -> None:

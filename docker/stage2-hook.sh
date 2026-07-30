@@ -231,8 +231,14 @@ chown_hermes_tree() {
         echo "[stage2] Warning: chown $target failed (rootless container?) — continuing"
 }
 
+managed_tree_needs_chown() {
+    target="$1"
+    [ "$(stat -c %u "$target" 2>/dev/null)" != "$actual_hermes_uid" ] || \
+        [ "$(stat -c %g "$target" 2>/dev/null)" != "$actual_hermes_gid" ]
+}
+
 needs_chown=false
-if [ "$(stat -c %u "$HERMES_HOME" 2>/dev/null)" != "$actual_hermes_uid" ]; then
+if managed_tree_needs_chown "$HERMES_HOME"; then
     needs_chown=true
 fi
 if [ "$needs_chown" = true ]; then

@@ -82,6 +82,31 @@ def test_repair_tree_prunes_nested_mount_root_and_contents(
     assert all(follow is False for _path, _dir_fd, follow in calls)
 
 
+def test_repair_tree_prunes_nested_file_mount_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    target = tmp_path / "home"
+    target.mkdir()
+    nested_mount = target / "external-file"
+    nested_mount.write_text("do not touch")
+    managed = target / "managed-state"
+    managed.write_text("repair")
+    mountinfo = _mountinfo(tmp_path / "mountinfo", target, nested_mount)
+    calls = _record_chown(monkeypatch, module)
+
+    module.repair_tree(
+        target,
+        os.getuid() + 1,
+        os.getgid() + 1,
+        mountinfo_path=mountinfo,
+    )
+
+    changed = {str(path) for path, _dir_fd, _follow in calls}
+    assert "managed-state" in changed
+    assert "external-file" not in changed
+
+
 def test_repair_tree_selects_gid_only_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
