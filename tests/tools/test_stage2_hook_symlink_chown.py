@@ -39,8 +39,10 @@ def _run_helper(
     script = (
         "set -eu\n"
         f'HERMES_HOME="{hermes_home}"\n'
+        "actual_hermes_uid=99\n"
+        "actual_hermes_gid=100\n"
         f"{_chown_hermes_tree_function(text)}\n"
-        f'chown() {{ printf "%s\\n" "$*" >> "{log_path}"; }}\n'
+        f'find() {{ printf "%s\\n" "$*" >> "{log_path}"; }}\n'
         f'chown_hermes_tree "{target}"\n'
     )
     return subprocess.run([shell, "-c", script], capture_output=True, text=True)
@@ -55,7 +57,8 @@ def test_chown_helper_repairs_real_directories(stage2_text: str, tmp_path: Path)
 
     assert proc.returncode == 0, proc.stderr
     assert log_path.read_text().splitlines() == [
-        f"-R hermes:hermes {target}",
+        f"{target} -xdev ( ! -uid 99 -o ! -gid 100 ) "
+        "-exec chown -h 99:100 {} +",
     ]
 
 
@@ -102,9 +105,15 @@ def test_chown_helper_refuses_target_under_symlinked_home(
 
 
 def test_stage2_uses_symlink_safe_helper_for_hermes_home_trees(stage2_text: str) -> None:
+    helper = _chown_hermes_tree_function(stage2_text)
+
     assert 'chown_hermes_tree "$HERMES_HOME/$sub"' in stage2_text
     assert 'chown_hermes_tree "$HERMES_HOME/profiles"' in stage2_text
     assert 'chown_hermes_tree "$HERMES_HOME/cron"' in stage2_text
+    assert 'find "$target" -xdev' in helper
+    assert '! -uid "$actual_hermes_uid" -o ! -gid "$actual_hermes_gid"' in helper
+    assert '-exec chown -h "$actual_hermes_uid:$actual_hermes_gid" {} +' in helper
+    assert "chown -R" not in helper
     assert 'chown -R hermes:hermes "$HERMES_HOME/$sub"' not in stage2_text
     assert 'chown -R hermes:hermes "$HERMES_HOME/profiles"' not in stage2_text
     assert 'chown -R hermes:hermes "$HERMES_HOME/cron"' not in stage2_text

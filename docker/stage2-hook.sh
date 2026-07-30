@@ -181,6 +181,7 @@ done
 # The canonical list of hermes-owned subdirs is the same one the s6-setuidgid
 # mkdir -p block below seeds. Keep them in sync if the seed list changes.
 actual_hermes_uid=$(id -u hermes)
+actual_hermes_gid=$(id -g hermes)
 
 path_has_symlink_component() {
     path="$1"
@@ -216,7 +217,12 @@ chown_hermes_tree() {
     if refuse_symlinked_path "recursive chown" "$target"; then
         return 0
     fi
-    chown -R hermes:hermes "$target" 2>/dev/null || \
+    # Large persistent profile trees may already contain millions of correctly
+    # owned entries.  Select only drifted inodes so warm starts do not rewrite
+    # every inode.  find's default -P behavior plus chown -h avoids following
+    # a final symlink; -xdev keeps reconciliation inside the managed volume.
+    find "$target" -xdev \( ! -uid "$actual_hermes_uid" -o ! -gid "$actual_hermes_gid" \) \
+        -exec chown -h "$actual_hermes_uid:$actual_hermes_gid" {} + 2>/dev/null || \
         echo "[stage2] Warning: chown $target failed (rootless container?) — continuing"
 }
 
