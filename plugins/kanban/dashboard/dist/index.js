@@ -548,7 +548,6 @@
     const reloadTimerRef = useRef(null);
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
-    const wsClosedRef = useRef(false);
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -598,6 +597,7 @@
           // deleted in the CLI while dashboard was open), fall back to
           // default so the UI doesn't hang on a 404.
           if (board && board !== "default" && !boards.find(function (b) { return b.slug === board; })) {
+            setSelectedTaskId(null);
             setBoard("default");
             writeSelectedBoard("default");
           }
@@ -628,9 +628,11 @@
     // --- WebSocket ---------------------------------------------------------
     useEffect(function () {
       if (!boardData) return undefined;
-      wsClosedRef.current = false;
+      let disposed = false;
+      let retryTimer = null;
+      let activeWs = null;
       function openWs() {
-        if (wsClosedRef.current) return;
+        if (disposed) return;
         // Build the WS URL via the host SDK so the correct auth param is used
         // in BOTH modes: single-use ?ticket= in gated OAuth mode, ?token= in
         // loopback. Reading window.__HERMES_SESSION_TOKEN__ directly (the old
@@ -646,9 +648,10 @@
         // Regression: #20879.
         if (board) wsParams.board = board;
         SDK.buildWsUrl(`${API}/events`, wsParams).then(function (url) {
-          if (wsClosedRef.current) return;
+          if (disposed) return;
           let ws;
           try { ws = new WebSocket(url); } catch (_e) { return; }
+          activeWs = ws;
           wsRef.current = ws;
           ws.onopen = function () { wsBackoffRef.current = 1000; };
           ws.onmessage = function (ev) {
@@ -669,7 +672,7 @@
             } catch (_e) { /* ignore */ }
           };
           ws.onclose = function (ev) {
-            if (wsClosedRef.current) return;
+            if (disposed) return;
             if (ev && ev.code === 1008) {
               setError(tx(t, "wsAuthFailed",
                 "WebSocket auth failed — reload the page to refresh the session token."));
@@ -677,21 +680,23 @@
             }
             const delay = Math.min(wsBackoffRef.current, 30000);
             wsBackoffRef.current = Math.min(wsBackoffRef.current * 2, 30000);
-            setTimeout(openWs, delay);
+            retryTimer = setTimeout(openWs, delay);
           };
         }).catch(function () {
           // Ticket mint / URL build failed (e.g. session expired). Back off
           // and retry; a hard auth failure surfaces via the 1008 close path.
-          if (wsClosedRef.current) return;
+          if (disposed) return;
           const delay = Math.min(wsBackoffRef.current, 30000);
           wsBackoffRef.current = Math.min(wsBackoffRef.current * 2, 30000);
-          setTimeout(openWs, delay);
+          retryTimer = setTimeout(openWs, delay);
         });
       }
       openWs();
       return function () {
-        wsClosedRef.current = true;
-        try { wsRef.current && wsRef.current.close(); } catch (_e) { /* noop */ }
+        disposed = true;
+        if (retryTimer !== null) clearTimeout(retryTimer);
+        try { activeWs && activeWs.close(); } catch (_e) { /* noop */ }
+        if (wsRef.current === activeWs) wsRef.current = null;
       };
     }, [!!boardData, board, scheduleReload]);
 
@@ -943,6 +948,9 @@
     // --- board switching ----------------------------------------------------
     const switchBoard = useCallback(function (nextSlug) {
       if (!nextSlug || nextSlug === board) return;
+      // Task identity is board-scoped. Clear it in the same batched update as
+      // the board change so TaskDrawer never renders the old id with new slug.
+      setSelectedTaskId(null);
       // Optimistic UI: clear the current grid + show loading, reset the
       // event cursor so the WS reopens aligned to the new board's
       // latest_event_id on the next loadBoard.
@@ -3158,12 +3166,33 @@
     const [homeChannels, setHomeChannels] = useState([]);
     const [homeBusy, setHomeBusy] = useState({});
     const boardSlug = props.boardSlug;
+    const loadGenerationRef = useRef(0);
+    const loadIdentityRef = useRef(null);
+    const loadIdentity = `${boardSlug || ""}:${props.taskId}`;
+    if (loadIdentityRef.current !== loadIdentity) {
+      loadIdentityRef.current = loadIdentity;
+      loadGenerationRef.current += 1;
+    }
 
     const load = useCallback(function () {
+      const generation = ++loadGenerationRef.current;
+      setData(null);
+      setErr(null);
+      setPatchErr(null);
+      setLoading(true);
       return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug))
-        .then(function (d) { setData(d); setErr(null); setPatchErr(null); })
-        .catch(function (e) { setErr(String(e.message || e)); })
-        .finally(function () { setLoading(false); });
+        .then(function (d) {
+          if (generation !== loadGenerationRef.current) return;
+          setData(d);
+        })
+        .catch(function (e) {
+          if (generation !== loadGenerationRef.current) return;
+          setErr(String(e.message || e));
+        })
+        .finally(function () {
+          if (generation !== loadGenerationRef.current) return;
+          setLoading(false);
+        });
     }, [props.taskId, boardSlug]);
 
     const loadHomeChannels = useCallback(function () {

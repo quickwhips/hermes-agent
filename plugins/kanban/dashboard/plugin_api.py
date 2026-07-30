@@ -116,13 +116,25 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
     return normed
 
 
-def _conn(board: Optional[str] = None):
-    """Open a kanban_db connection, creating the schema on first use.
+def _read_conn(board: Optional[str] = None):
+    """Open an existing board without schema, WAL, or filesystem writes."""
+    try:
+        return kanban_db.connect_readonly(board=board)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail="kanban database is not initialized",
+        )
+
+
+def _write_conn(board: Optional[str] = None):
+    """Open a writable connection, explicitly initializing first.
 
     Every handler that mutates the DB goes through this so the plugin
     self-heals on a fresh install (no user-visible "no such table"
     error if somebody hits POST /tasks before GET /board).
-    ``init_db`` is idempotent.
+    ``init_db`` is idempotent. Read handlers must use :func:`_read_conn` so
+    polling cannot rerun migration or write-path setup.
 
     ``board`` is the query-param slug (already normalised by
     :func:`_resolve_board`). When ``None`` the active board is used
@@ -389,15 +401,15 @@ def get_board(
 ):
     """Return the full board grouped by status column.
 
-    ``_conn()`` auto-initializes ``kanban.db`` on first call so a fresh
-    install doesn't surface a "failed to load" error on the plugin tab.
+    The board must already have been initialized by an explicit startup, CLI,
+    or mutation boundary. Reads never create or migrate a database.
 
     ``board`` selects which board to read from. Omitting it falls
     through to the active board (``HERMES_KANBAN_BOARD`` env → on-disk
     ``current`` pointer → ``default``).
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _read_conn(board=board)
     try:
         tasks = kanban_db.list_tasks(
             conn,
@@ -526,7 +538,7 @@ def get_task(
     ),
 ):
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _read_conn(board=board)
     try:
         if (run_state_type is None) ^ (run_state_name is None):
             raise HTTPException(
@@ -615,7 +627,7 @@ class CreateTaskBody(BaseModel):
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         task_id = kanban_db.create_task(
             conn,
@@ -687,7 +699,7 @@ from hermes_cli.kanban_db import (  # noqa: E402
 @router.get("/tasks/{task_id}/attachments")
 def list_task_attachments(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _read_conn(board=board)
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -714,7 +726,7 @@ async def upload_task_attachment(
     absolute path surfaced in ``build_worker_context``.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -773,7 +785,7 @@ async def upload_task_attachment(
 @router.get("/attachments/{attachment_id}")
 def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _read_conn(board=board)
     try:
         att = kanban_db.get_attachment(conn, attachment_id)
         if att is None:
@@ -800,7 +812,7 @@ def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 @router.delete("/attachments/{attachment_id}")
 def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         att = kanban_db.delete_attachment(conn, attachment_id)
         if att is None:
@@ -839,7 +851,7 @@ class UpdateTaskBody(BaseModel):
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         task = kanban_db.get_task(conn, task_id)
         if task is None:
@@ -978,7 +990,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
@@ -1127,7 +1139,7 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body is required")
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -1151,7 +1163,7 @@ class LinkBody(BaseModel):
 @router.post("/links")
 def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
         return {"ok": True}
@@ -1168,7 +1180,7 @@ def delete_link(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
         return {"ok": bool(ok)}
@@ -1208,7 +1220,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
         raise HTTPException(status_code=400, detail="ids is required")
     results: list[dict] = []
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         for tid in ids:
             entry: dict[str, Any] = {"id": tid, "ok": True}
@@ -1332,7 +1344,7 @@ def list_diagnostics(
     directly when it isn't.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _read_conn(board=board)
     try:
         diags_by_task = _compute_task_diagnostics(conn, task_ids=None)
         if not diags_by_task:
@@ -1415,7 +1427,7 @@ def list_active_workers(
     its task without a second round-trip.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _read_conn(board=board)
     try:
         rows = conn.execute(
             """
@@ -1474,7 +1486,7 @@ def get_run_endpoint(
     404 when no such run exists.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _read_conn(board=board)
     try:
         r = kanban_db.get_run(conn, run_id)
         if r is None:
@@ -1503,7 +1515,7 @@ def inspect_run_endpoint(
     ``reason="psutil not available"``.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _read_conn(board=board)
     try:
         r = kanban_db.get_run(conn, run_id)
         if r is None:
@@ -1580,7 +1592,7 @@ def terminate_run_endpoint(
     ``/runs/{run_id}/inspect``) but no termination control surface.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         r = kanban_db.get_run(conn, run_id)
         if r is None:
@@ -1626,7 +1638,7 @@ def reclaim_task_endpoint(
     ``hermes kanban reclaim <task_id> --reason ...``.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
         if not ok:
@@ -1714,7 +1726,7 @@ def reassign_task_endpoint(
     Maps 1:1 to ``hermes kanban reassign <task_id> <profile> [--reclaim]``.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         ok = kanban_db.reassign_task(
             conn, task_id,
@@ -1843,7 +1855,7 @@ def get_home_channels(
     subscribed_homes: set[tuple[str, str, str]] = set()
     if task_id:
         board = _resolve_board(board)
-        conn = _conn(board=board)
+        conn = _read_conn(board=board)
         try:
             subs = kanban_db.list_notify_subs(conn, task_id)
         finally:
@@ -1879,7 +1891,7 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
                    f"gateway.platforms.{platform}.home_channel in config.yaml.",
         )
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         task = kanban_db.get_task(conn, task_id)
         if task is None:
@@ -1908,7 +1920,7 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
             detail=f"No home channel configured for platform {platform!r}.",
         )
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         kanban_db.remove_notify_sub(
             conn,
@@ -1935,7 +1947,7 @@ def get_stats(board: Optional[str] = Query(None)):
     board themselves.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _read_conn(board=board)
     try:
         return kanban_db.board_stats(conn)
     finally:
@@ -1952,7 +1964,7 @@ def get_assignees(board: Optional[str] = Query(None)):
     appears in the picker before it's been given any task.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _read_conn(board=board)
     try:
         return {"assignees": kanban_db.known_assignees(conn)}
     finally:
@@ -1978,7 +1990,7 @@ def get_task_log(
     generations, so disk usage per task is bounded at ~4 MiB.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _read_conn(board=board)
     try:
         task = kanban_db.get_task(conn, task_id)
     finally:
@@ -2010,7 +2022,7 @@ def dispatch(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _write_conn(board=board)
     try:
         result = kanban_db.dispatch_once(
             conn, dry_run=dry_run, max_spawn=max_n, board=board,
@@ -2097,7 +2109,7 @@ def _board_counts(slug: str) -> dict[str, int]:
         path = kanban_db.kanban_db_path(board=slug)
         if not path.exists():
             return {}
-        conn = kanban_db.connect(board=slug)
+        conn = kanban_db.connect_readonly(board=slug)
         try:
             rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
@@ -2549,7 +2561,7 @@ async def stream_events(ws: WebSocket):
             ws_board = None
 
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
-            conn = kanban_db.connect(board=ws_board)
+            conn = kanban_db.connect_readonly(board=ws_board)
             try:
                 rows = conn.execute(
                     "SELECT id, task_id, run_id, kind, payload, created_at "

@@ -80,6 +80,122 @@ def test_board_empty(client):
     assert data["latest_event_id"] == 0
 
 
+def test_repeated_board_gets_do_not_rerun_explicit_initialization(client, monkeypatch):
+    """Steady-state polling must not force the schema/migration write path."""
+    calls = []
+    original = kb.init_db
+
+    def recording_init_db(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "init_db", recording_init_db)
+
+    first = client.get("/api/plugins/kanban/board")
+    second = client.get("/api/plugins/kanban/board")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls == []
+
+
+def test_board_read_missing_db_fails_closed_without_creating_it(tmp_path, monkeypatch):
+    """GET /board must not create or migrate a missing database."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    db_path = kb.kanban_db_path(board="default")
+
+    app = FastAPI()
+    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+    response = TestClient(app).get("/api/plugins/kanban/board")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "kanban database is not initialized"
+    assert not db_path.exists()
+
+
+def test_mutation_still_initializes_missing_default_board(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    db_path = kb.kanban_db_path(board="default")
+
+    app = FastAPI()
+    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+    response = TestClient(app).post(
+        "/api/plugins/kanban/tasks?board=default",
+        json={"title": "initialize through mutation"},
+    )
+
+    assert response.status_code == 200
+    assert db_path.is_file()
+
+
+def test_board_switch_closes_task_drawer_before_changing_board_identity():
+    """An open task from board A must never be fetched against board B."""
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    switch_start = bundle.index("const switchBoard = useCallback(function (nextSlug)")
+    switch_end = bundle.index("const createNewBoard", switch_start)
+    switch_body = bundle[switch_start:switch_end]
+
+    assert switch_body.index("setSelectedTaskId(null);") < switch_body.index(
+        "setBoard(nextSlug);"
+    )
+
+
+def test_board_switch_disposes_only_its_websocket_generation():
+    """A stale socket callback must not reopen the board it belonged to."""
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    effect_start = bundle.index("// --- WebSocket")
+    effect_end = bundle.index("// --- filtering", effect_start)
+    effect = bundle[effect_start:effect_end]
+
+    assert "let disposed = false;" in effect
+    assert "let retryTimer = null;" in effect
+    assert effect.count("if (disposed) return;") >= 4
+    assert effect.index("disposed = true;") < effect.index("clearTimeout(retryTimer);")
+    assert "wsClosedRef" not in bundle
+
+
+def test_task_drawer_ignores_stale_detail_responses_after_identity_change():
+    """A late board-A response must not restore data/error state in board B."""
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    drawer_start = bundle.index("function TaskDrawer(props)")
+    drawer_end = bundle.index("const handleComment", drawer_start)
+    drawer_load = bundle[drawer_start:drawer_end]
+
+    assert "const loadGenerationRef = useRef(0);" in drawer_load
+    assert "const generation = ++loadGenerationRef.current;" in drawer_load
+    assert drawer_load.count("generation !== loadGenerationRef.current") >= 2
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------

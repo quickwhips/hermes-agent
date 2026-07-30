@@ -4,6 +4,8 @@ import sqlite3
 import threading
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 
 
@@ -69,6 +71,45 @@ def _table_struct(conn: sqlite3.Connection, table: str):
     return cols, idx
 
 
+
+
+def test_readonly_connect_missing_db_fails_without_creating_parent(tmp_path):
+    db_path = tmp_path / "missing" / "nested" / "kanban.db"
+
+    with pytest.raises(FileNotFoundError):
+        kb.connect_readonly(db_path)
+
+    assert not db_path.exists()
+    assert not db_path.parent.exists()
+
+
+def test_readonly_connect_is_query_only_and_does_not_reinitialize(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    with kb.connect(db_path) as writable:
+        kb.create_task(writable, title="read me")
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    before = {
+        path.name: (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in tmp_path.iterdir()
+    }
+
+    for _ in range(2):
+        conn = kb.connect_readonly(db_path)
+        try:
+            assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                conn.execute("UPDATE tasks SET title = 'write attempted'")
+        finally:
+            conn.close()
+
+    after = {
+        path.name: (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in tmp_path.iterdir()
+    }
+    assert after == before
+    assert str(db_path.resolve()) not in kb._INITIALIZED_PATHS
 
 
 def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkeypatch):
