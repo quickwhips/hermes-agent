@@ -222,6 +222,47 @@ def test_missing_database_read_routes_return_empty_or_not_found(tmp_path, monkey
         "runs": [],
         "limit": 20,
     }
+    assert web_server._get_usage_analytics(days=7) == {
+        "daily": [],
+        "by_model": [],
+        "by_task": [],
+        "totals": {
+            "total_input": None,
+            "total_output": None,
+            "total_cache_read": None,
+            "total_reasoning": None,
+            "total_estimated_cost": 0,
+            "total_actual_cost": 0,
+            "total_sessions": 0,
+            "total_api_calls": None,
+        },
+        "period_days": 7,
+        "skills": {
+            "summary": {
+                "total_skill_loads": 0,
+                "total_skill_edits": 0,
+                "total_skill_actions": 0,
+                "distinct_skills_used": 0,
+            },
+            "top_skills": [],
+        },
+        "tools": [],
+    }
+    assert web_server._get_models_analytics(days=7) == {
+        "models": [],
+        "totals": {
+            "distinct_models": 0,
+            "total_input": None,
+            "total_output": None,
+            "total_cache_read": None,
+            "total_reasoning": None,
+            "total_estimated_cost": 0,
+            "total_actual_cost": 0,
+            "total_sessions": 0,
+            "total_api_calls": None,
+        },
+        "period_days": 7,
+    }
 
     for read in (
         lambda: web_server.get_session_detail("missing"),
@@ -233,6 +274,76 @@ def test_missing_database_read_routes_return_empty_or_not_found(tmp_path, monkey
             asyncio.run(read())
         assert exc_info.value.status_code == 404
 
+    assert not db_path.exists()
+    assert not db_path.parent.exists()
+
+
+def test_missing_named_profile_analytics_preserve_empty_contract(tmp_path, monkeypatch):
+    profile_home = tmp_path / "missing-profile"
+    monkeypatch.setattr(
+        web_server,
+        "_cron_profile_home",
+        lambda profile: (profile, profile_home),
+    )
+
+    assert web_server._get_usage_analytics(days=3, profile="fresh") == {
+        "daily": [],
+        "by_model": [],
+        "by_task": [],
+        "totals": {
+            "total_input": None,
+            "total_output": None,
+            "total_cache_read": None,
+            "total_reasoning": None,
+            "total_estimated_cost": 0,
+            "total_actual_cost": 0,
+            "total_sessions": 0,
+            "total_api_calls": None,
+        },
+        "period_days": 3,
+        "skills": {
+            "summary": {
+                "total_skill_loads": 0,
+                "total_skill_edits": 0,
+                "total_skill_actions": 0,
+                "distinct_skills_used": 0,
+            },
+            "top_skills": [],
+        },
+        "tools": [],
+    }
+    assert web_server._get_models_analytics(days=3, profile="fresh") == {
+        "models": [],
+        "totals": {
+            "distinct_models": 0,
+            "total_input": None,
+            "total_output": None,
+            "total_cache_read": None,
+            "total_reasoning": None,
+            "total_estimated_cost": 0,
+            "total_actual_cost": 0,
+            "total_sessions": 0,
+            "total_api_calls": None,
+        },
+        "period_days": 3,
+    }
+    assert not profile_home.exists()
+
+
+def test_missing_database_resume_lookup_preserves_requested_session(tmp_path, monkeypatch):
+    import hermes_state
+
+    db_path = tmp_path / "missing" / "state.db"
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+    monkeypatch.setattr(
+        "hermes_cli.main._make_tui_argv",
+        lambda root, tui_dev=False: (["node", "fake-tui.js"], None),
+    )
+
+    _argv, _cwd, env = web_server._resolve_chat_argv(resume="missing-session")
+
+    assert env is not None
+    assert env["HERMES_TUI_RESUME"] == "missing-session"
     assert not db_path.exists()
     assert not db_path.parent.exists()
 

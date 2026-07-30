@@ -13862,8 +13862,40 @@ def _aux_task_summary(aux_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return result
 
 
+def _empty_usage_analytics(days: int) -> Dict[str, Any]:
+    return {
+        "daily": [],
+        "by_model": [],
+        "by_task": [],
+        "totals": {
+            "total_input": None,
+            "total_output": None,
+            "total_cache_read": None,
+            "total_reasoning": None,
+            "total_estimated_cost": 0,
+            "total_actual_cost": 0,
+            "total_sessions": 0,
+            "total_api_calls": None,
+        },
+        "period_days": days,
+        "skills": {
+            "summary": {
+                "total_skill_loads": 0,
+                "total_skill_edits": 0,
+                "total_skill_actions": 0,
+                "distinct_skills_used": 0,
+            },
+            "top_skills": [],
+        },
+        "tools": [],
+    }
+
+
 def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
     from agent.insights import InsightsEngine
+
+    if not _session_db_exists_for_profile(profile):
+        return _empty_usage_analytics(days)
 
     db = _open_session_db_for_profile(profile, read_only=True)
     try:
@@ -13948,12 +13980,33 @@ async def get_usage_analytics(days: int = 30, profile: Optional[str] = None):
     return await asyncio.to_thread(_get_usage_analytics, days, profile)
 
 
+def _empty_models_analytics(days: int) -> Dict[str, Any]:
+    return {
+        "models": [],
+        "totals": {
+            "distinct_models": 0,
+            "total_input": None,
+            "total_output": None,
+            "total_cache_read": None,
+            "total_reasoning": None,
+            "total_estimated_cost": 0,
+            "total_actual_cost": 0,
+            "total_sessions": 0,
+            "total_api_calls": None,
+        },
+        "period_days": days,
+    }
+
+
 def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
     """Rich per-model analytics for the Models dashboard page.
 
     Returns token/cost/session breakdown per model plus capability metadata
     from models.dev (context window, vision, tools, reasoning, etc.).
     """
+    if not _session_db_exists_for_profile(profile):
+        return _empty_models_analytics(days)
+
     db = _open_session_db_for_profile(profile, read_only=True)
     try:
         cutoff = time.time() - (days * 86400)
@@ -14596,16 +14649,18 @@ def _resolve_chat_argv(
         env["HERMES_HOME"] = str(profile_dir)
 
     if resume:
-        _resume_db = _open_session_db_for_profile(
-            requested if profile_dir is not None else None,
-            read_only=True,
-        )
-        try:
-            latest_resume, _latest_path = _session_latest_descendant(resume, _resume_db)
-        finally:
-            _resume_db.close()
-        if latest_resume:
-            resume = latest_resume
+        resume_profile = requested if profile_dir is not None else None
+        if _session_db_exists_for_profile(resume_profile):
+            _resume_db = _open_session_db_for_profile(
+                resume_profile,
+                read_only=True,
+            )
+            try:
+                latest_resume, _latest_path = _session_latest_descendant(resume, _resume_db)
+            finally:
+                _resume_db.close()
+            if latest_resume:
+                resume = latest_resume
         env["HERMES_TUI_RESUME"] = resume
 
     if sidecar_url:
