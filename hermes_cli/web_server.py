@@ -11534,6 +11534,9 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
     except (TypeError, ValueError):
         limit_n = 20
 
+    if not _session_db_exists_for_profile(selected):
+        return {"runs": [], "limit": limit_n}
+
     db = _open_session_db_for_profile(selected, read_only=True)
     try:
         runs = db.list_cron_job_runs(canonical, limit=limit_n, offset=0)

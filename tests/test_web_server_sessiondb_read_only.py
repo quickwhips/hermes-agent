@@ -218,6 +218,10 @@ def test_missing_database_read_routes_return_empty_or_not_found(tmp_path, monkey
         "messages": 0,
         "by_source": {},
     }
+    assert web_server._list_cron_job_runs_sync("never-ran") == {
+        "runs": [],
+        "limit": 20,
+    }
 
     for read in (
         lambda: web_server.get_session_detail("missing"),
