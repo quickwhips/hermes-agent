@@ -94,13 +94,13 @@ fi
 RUNNER_VENV=""
 if [ "${CI:-}" = "true" ] && [ -n "$VENV" ]; then
   RUNNER_VENV="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/hermes-test-venv.XXXXXX")"
+  trap 'rm -rf "$RUNNER_VENV"' EXIT
   if ! cp -a -l "$VENV/." "$RUNNER_VENV/" 2>/dev/null; then
     rm -rf "$RUNNER_VENV"
     RUNNER_VENV="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/hermes-test-venv.XXXXXX")"
     cp -a "$VENV/." "$RUNNER_VENV/"
   fi
   PYTHON="$RUNNER_VENV/bin/python"
-  trap 'rm -rf "$RUNNER_VENV"' EXIT
   echo "▶ CI runner venv snapshot: $RUNNER_VENV"
 fi
 
