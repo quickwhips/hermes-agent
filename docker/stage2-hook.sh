@@ -231,6 +231,24 @@ chown_hermes_tree() {
         echo "[stage2] Warning: chown $target failed (rootless container?) — continuing"
 }
 
+chown_hermes_path() {
+    target="$1"
+    mode="${2:-}"
+    if [ ! -x "$INSTALL_DIR/.venv/bin/python" ]; then
+        echo "[stage2] Warning: cannot safely chown $target — continuing"
+        return 0
+    fi
+    if [ -n "$mode" ]; then
+        "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/docker/chown_hermes_tree.py" \
+            --single --mode "$mode" "$target" "$actual_hermes_uid" "$actual_hermes_gid" \
+            2>/dev/null || echo "[stage2] Warning: chown/chmod $target failed (rootless container?) — continuing"
+    else
+        "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/docker/chown_hermes_tree.py" \
+            --single "$target" "$actual_hermes_uid" "$actual_hermes_gid" 2>/dev/null || \
+            echo "[stage2] Warning: chown $target failed (rootless container?) — continuing"
+    fi
+}
+
 managed_tree_needs_chown() {
     target="$1"
     [ "$(stat -c %u "$target" 2>/dev/null)" != "$actual_hermes_uid" ] || \
@@ -250,12 +268,7 @@ if [ "$needs_chown" = true ]; then
     # Top-level $HERMES_HOME: chown the directory itself (not its contents)
     # so hermes can mkdir new subdirs but bind-mounted host files keep
     # their existing ownership.
-    if refuse_symlinked_path "chown" "$HERMES_HOME"; then
-        :
-    else
-        chown hermes:hermes "$HERMES_HOME" 2>/dev/null || \
-            echo "[stage2] Warning: chown $HERMES_HOME failed (rootless container?) — continuing"
-    fi
+    chown_hermes_path "$HERMES_HOME"
     # Hermes-owned subdirs: recursive chown is safe here because these are
     # created and managed exclusively by hermes (see the s6-setuidgid mkdir
     # -p block below for the canonical list).
@@ -312,11 +325,7 @@ fi
 # s6-setuidgid hermes mkdir failing with Permission denied. Non-recursive:
 # profile leaf dirs are each created/owned by their own log/run as hermes.
 if [ -d "$HERMES_HOME/logs/gateways" ]; then
-    if refuse_symlinked_path "chown" "$HERMES_HOME/logs/gateways"; then
-        :
-    else
-        chown hermes:hermes "$HERMES_HOME/logs/gateways" 2>/dev/null || true
-    fi
+    chown_hermes_path "$HERMES_HOME/logs/gateways"
 fi
 
 # Always reset ownership of pairing data on every boot, same docker-exec/
@@ -359,11 +368,7 @@ for f in \
     gateway.pid gateway.lock gateway_state.json processes.json \
     active_profile; do
     if [ -e "$HERMES_HOME/$f" ]; then
-        if refuse_symlinked_path "chown" "$HERMES_HOME/$f"; then
-            :
-        else
-            chown hermes:hermes "$HERMES_HOME/$f" 2>/dev/null || true
-        fi
+        chown_hermes_path "$HERMES_HOME/$f"
     fi
 done
 
@@ -371,12 +376,7 @@ done
 # Ensure config.yaml is readable by the hermes runtime user even if it
 # was edited on the host after initial ownership setup.
 if [ -f "$HERMES_HOME/config.yaml" ]; then
-    if refuse_symlinked_path "chown/chmod" "$HERMES_HOME/config.yaml"; then
-        :
-    else
-        chown hermes:hermes "$HERMES_HOME/config.yaml" 2>/dev/null || true
-        chmod 640 "$HERMES_HOME/config.yaml" 2>/dev/null || true
-    fi
+    chown_hermes_path "$HERMES_HOME/config.yaml" 640
 fi
 
 # --- Seed directory structure as hermes user ---
@@ -446,8 +446,7 @@ if [ -f "$HERMES_HOME/.env" ]; then
     if refuse_symlinked_path "chown/chmod" "$HERMES_HOME/.env"; then
         :
     else
-        chown hermes:hermes "$HERMES_HOME/.env" 2>/dev/null || true
-        chmod 600 "$HERMES_HOME/.env" 2>/dev/null || true
+        chown_hermes_path "$HERMES_HOME/.env" 600
     fi
 fi
 
@@ -470,8 +469,7 @@ if [ ! -f "$HERMES_HOME/auth.json" ] && [ -n "${HERMES_AUTH_JSON_BOOTSTRAP:-}" ]
         :
     else
         printf '%s' "$HERMES_AUTH_JSON_BOOTSTRAP" > "$HERMES_HOME/auth.json"
-        chown hermes:hermes "$HERMES_HOME/auth.json" 2>/dev/null || true
-        chmod 600 "$HERMES_HOME/auth.json"
+        chown_hermes_path "$HERMES_HOME/auth.json" 600
     fi
 fi
 
@@ -532,8 +530,7 @@ if [ ! -f "$HERMES_HOME/gateway_state.json" ] && \
         :
     else
         printf '{"gateway_state":"running"}\n' > "$HERMES_HOME/gateway_state.json"
-        chown hermes:hermes "$HERMES_HOME/gateway_state.json" 2>/dev/null || true
-        chmod 644 "$HERMES_HOME/gateway_state.json"
+        chown_hermes_path "$HERMES_HOME/gateway_state.json" 644
     fi
 fi
 

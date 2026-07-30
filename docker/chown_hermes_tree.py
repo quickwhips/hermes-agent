@@ -10,6 +10,7 @@ from pathlib import Path
 
 _MOUNT_ESCAPE = re.compile(r"\\(040|011|012|134)")
 _MOUNT_DEVICE = re.compile(r"[0-9]+:[0-9]+")
+_MOUNT_OPTIONAL = re.compile(r"(?:shared|master|propagate_from):[0-9]+|unbindable")
 _MOUNT_DECODE = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
@@ -17,12 +18,26 @@ _DIRECTORY_FLAGS = (
     | getattr(os, "O_CLOEXEC", 0)
     | getattr(os, "O_NOFOLLOW", 0)
 )
+_FILE_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+)
 
 
 def _decode_mount_path(value: str) -> str:
     if re.search(r"\\(?!040|011|012|134)", value):
         raise ValueError("malformed mountinfo path escape")
     return _MOUNT_ESCAPE.sub(lambda match: _MOUNT_DECODE[match.group(1)], value)
+
+
+def _validate_mount_options(value: str) -> None:
+    _decode_mount_path(value)
+    if not value or any(not item for item in value.split(",")):
+        raise ValueError("malformed mountinfo options")
+    if any(not item.isascii() or not item.isprintable() for item in value):
+        raise ValueError("malformed mountinfo options")
 
 
 def _mountpoints(path: Path) -> frozenset[str]:
@@ -47,7 +62,21 @@ def _mountpoints(path: Path) -> frozenset[str]:
             separator = fields.index("-")
             if separator < 6 or len(fields) != separator + 4:
                 raise ValueError("malformed mountinfo record")
+            _decode_mount_path(fields[3])
             point = _decode_mount_path(fields[4])
+            _validate_mount_options(fields[5])
+            if any(
+                _MOUNT_OPTIONAL.fullmatch(field) is None
+                for field in fields[6:separator]
+            ):
+                raise ValueError("malformed mountinfo optional field")
+            if (
+                not fields[separator + 1].isascii()
+                or not fields[separator + 1].isprintable()
+            ):
+                raise ValueError("malformed mountinfo filesystem type")
+            _decode_mount_path(fields[separator + 2])
+            _validate_mount_options(fields[separator + 3])
             if not os.path.isabs(point):
                 raise ValueError("malformed mountinfo record")
             points.add(point)
@@ -81,6 +110,49 @@ def _open_anchored_root(target: str) -> int:
         os.close(descriptor)
         raise
     return descriptor
+
+
+def _open_anchored_parent(target: str) -> tuple[int, str]:
+    parts = Path(target).parts
+    if len(parts) < 2:
+        raise ValueError("ownership path must name an entry below root")
+    descriptor = os.open("/", _DIRECTORY_FLAGS)
+    try:
+        for component in parts[1:-1]:
+            next_descriptor = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, parts[-1]
+
+
+def repair_path(target: Path, uid: int, gid: int, *, mode: int | None = None) -> None:
+    """Repair one directory or regular file through an anchored descriptor."""
+    target_text = os.path.abspath(os.fspath(target))
+    parent_fd, name = _open_anchored_parent(target_text)
+    descriptor: int | None = None
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(before.st_mode) and not stat.S_ISREG(before.st_mode):
+            raise OSError(
+                f"ownership target is not a directory or regular file: {target_text}"
+            )
+        descriptor = os.open(name, _FILE_FLAGS, dir_fd=parent_fd)
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise OSError(f"ownership target changed during resolution: {target_text}")
+        if not stat.S_ISDIR(after.st_mode) and not stat.S_ISREG(after.st_mode):
+            raise OSError(f"ownership target changed type during resolution: {target_text}")
+        if after.st_uid != uid or after.st_gid != gid:
+            os.fchown(descriptor, uid, gid)
+        if mode is not None:
+            os.fchmod(descriptor, mode)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_fd)
 
 
 def repair_tree(
@@ -142,6 +214,8 @@ def repair_tree(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--single", action="store_true")
+    parser.add_argument("--mode", type=lambda value: int(value, 8))
     parser.add_argument("target", type=Path)
     parser.add_argument("uid", type=int)
     parser.add_argument("gid", type=int)
@@ -152,7 +226,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.uid < 0 or args.gid < 0:
         raise ValueError("UID and GID must be non-negative")
-    repair_tree(args.target, args.uid, args.gid)
+    if args.mode is not None and not args.single:
+        raise ValueError("--mode requires --single")
+    if args.mode is not None and not 0 <= args.mode <= 0o7777:
+        raise ValueError("mode must be between 0000 and 7777")
+    if args.single:
+        repair_path(args.target, args.uid, args.gid, mode=args.mode)
+    else:
+        repair_tree(args.target, args.uid, args.gid)
     return 0
 
 

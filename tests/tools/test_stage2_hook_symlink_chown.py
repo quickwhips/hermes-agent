@@ -177,4 +177,14 @@ def test_stage2_uses_symlink_safe_helper_for_hermes_home_trees(stage2_text: str)
 def test_stage2_skips_top_level_chown_for_symlinked_hermes_home(
     stage2_text: str,
 ) -> None:
-    assert 'refuse_symlinked_path "chown" "$HERMES_HOME"' in stage2_text
+    assert 'chown_hermes_path "$HERMES_HOME"' in stage2_text
+
+
+def test_stage2_routes_every_mutable_home_ownership_change_through_helper(
+    stage2_text: str,
+) -> None:
+    assert 'chown_hermes_path "$HERMES_HOME/logs/gateways"' in stage2_text
+    assert 'chown_hermes_path "$HERMES_HOME/$f"' in stage2_text
+    assert 'chown_hermes_path "$HERMES_HOME/config.yaml" 640' in stage2_text
+    assert "chown hermes:hermes" not in stage2_text
+    assert 'chmod 640 "$HERMES_HOME/config.yaml"' not in stage2_text

@@ -256,6 +256,96 @@ def test_intermediate_symlink_cannot_redirect_anchored_root(
     assert calls == []
 
 
+def test_repair_path_repairs_directory_and_regular_file_by_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    directory = tmp_path / "gateways"
+    directory.mkdir()
+    state_file = tmp_path / "state.db"
+    state_file.write_text("state")
+    calls = _record_chown(monkeypatch, module)
+
+    module.repair_path(directory, os.getuid() + 1, os.getgid() + 1)
+    module.repair_path(state_file, os.getuid() + 1, os.getgid() + 1)
+
+    assert len(calls) == 2
+    assert all(str(path).startswith("fd:") for path, _fd, _follow in calls)
+
+
+def test_repair_path_rejects_intermediate_and_final_symlinks_before_chown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    target = real_parent / "state.db"
+    target.write_text("state")
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    linked_file = tmp_path / "linked-state"
+    linked_file.symlink_to(target)
+    calls = _record_chown(monkeypatch, module)
+
+    with pytest.raises(OSError):
+        module.repair_path(linked_parent / "state.db", os.getuid() + 1, os.getgid())
+    with pytest.raises(OSError):
+        module.repair_path(linked_file, os.getuid() + 1, os.getgid())
+
+    assert calls == []
+
+
+def test_repair_path_applies_mode_through_open_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    target = tmp_path / "config.yaml"
+    target.write_text("model: test")
+    modes: list[tuple[int, int]] = []
+    _record_chown(monkeypatch, module)
+    monkeypatch.setattr(
+        module.os,
+        "fchmod",
+        lambda descriptor, mode: modes.append((descriptor, mode)),
+    )
+
+    module.repair_path(target, os.getuid(), os.getgid(), mode=0o640)
+
+    assert len(modes) == 1
+    assert modes[0][0] >= 0
+    assert modes[0][1] == 0o640
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "1 2 0:1 /bad\\999 /fake rw - ext4 /dev/root rw\n",
+        "1 2 0:1 / /fake rw bad_optional - ext4 /dev/root rw\n",
+        "1 2 0:1 / /fake rw - ext4 /dev/\\999 rw\n",
+        "1 2 0:1 / /fake rw,,nodev - ext4 /dev/root rw\n",
+    ],
+    ids=["bad_root_escape", "bad_optional", "bad_source_escape", "bad_options"],
+)
+def test_mountinfo_field_grammar_fails_before_any_chown(
+    record: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    target = tmp_path / "home"
+    target.mkdir()
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(record)
+    calls = _record_chown(monkeypatch, module)
+
+    with pytest.raises(ValueError, match="malformed mountinfo"):
+        module.repair_tree(
+            target,
+            os.getuid() + 1,
+            os.getgid() + 1,
+            mountinfo_path=mountinfo,
+        )
+    assert calls == []
+
+
 def test_helper_has_no_per_entry_process_spawn() -> None:
     source = HELPER.read_text()
 
