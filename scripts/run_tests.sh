@@ -84,6 +84,26 @@ else
   exit 1
 fi
 
+# CI exercises updater and runtime-repair paths that may atomically replace the
+# checkout's .venv. The per-file runner launches hundreds of subprocesses from
+# that interpreter, so replacing it mid-run makes every later subprocess fail
+# with "No module named pytest". Run the coordinator and its children from a
+# hard-linked snapshot instead. Runtime-repair tests can still replace the
+# checkout venv, but the already-selected runner environment remains immutable.
+# A regular copy is the portable fallback when hard links are unavailable.
+RUNNER_VENV=""
+if [ "${CI:-}" = "true" ] && [ -n "$VENV" ]; then
+  RUNNER_VENV="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/hermes-test-venv.XXXXXX")"
+  if ! cp -a -l "$VENV/." "$RUNNER_VENV/" 2>/dev/null; then
+    rm -rf "$RUNNER_VENV"
+    RUNNER_VENV="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/hermes-test-venv.XXXXXX")"
+    cp -a "$VENV/." "$RUNNER_VENV/"
+  fi
+  PYTHON="$RUNNER_VENV/bin/python"
+  trap 'rm -rf "$RUNNER_VENV"' EXIT
+  echo "▶ CI runner venv snapshot: $RUNNER_VENV"
+fi
+
 
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────
 EXTRA_PYTHONPATH=""
@@ -111,7 +131,8 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
-exec env -i \
+set +e
+env -i \
   PATH="$PATH" \
   HOME="$HOME" \
   TZ=UTC \
@@ -123,3 +144,6 @@ exec env -i \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
   "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"
+status=$?
+set -e
+exit "$status"
