@@ -52,7 +52,11 @@ def _record_chown(monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> list[t
     ) -> None:
         calls.append((path, dir_fd, follow_symlinks))
 
+    def fake_fchown(descriptor: int, _uid: int, _gid: int) -> None:
+        calls.append((f"fd:{descriptor}", descriptor, False))
+
     monkeypatch.setattr(module.os, "chown", fake_chown)
+    monkeypatch.setattr(module.os, "fchown", fake_fchown)
     return calls
 
 
@@ -197,12 +201,71 @@ def test_repair_tree_rejects_malformed_mountinfo_before_chown(
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    "record",
+    [
+        "1 2 0:1 / /fake rw\n",
+        "1 2 0:1 / /fake rw - ext4\n",
+        "1  2 0:1 / /fake rw - ext4 /dev/root rw\n",
+        "\n",
+    ],
+    ids=["missing_separator", "missing_post_fields", "double_space", "blank"],
+)
+def test_structurally_malformed_mountinfo_fails_before_any_chown(
+    record: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    target = tmp_path / "home"
+    target.mkdir()
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(record)
+    calls = _record_chown(monkeypatch, module)
+
+    with pytest.raises(ValueError, match="malformed mountinfo"):
+        module.repair_tree(
+            target,
+            os.getuid() + 1,
+            os.getgid() + 1,
+            mountinfo_path=mountinfo,
+        )
+    assert calls == []
+
+
+def test_intermediate_symlink_cannot_redirect_anchored_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    foreign_parent = tmp_path / "foreign"
+    target = foreign_parent / "managed"
+    target.mkdir(parents=True)
+    (target / "victim").write_text("do not touch")
+    link_parent = tmp_path / "link-home"
+    link_parent.symlink_to(foreign_parent, target_is_directory=True)
+    redirected_target = link_parent / "managed"
+    mountinfo = _mountinfo(tmp_path / "mountinfo", redirected_target)
+    calls = _record_chown(monkeypatch, module)
+
+    with pytest.raises(OSError):
+        module.repair_tree(
+            redirected_target,
+            os.getuid() + 1,
+            os.getgid() + 1,
+            mountinfo_path=mountinfo,
+        )
+
+    assert calls == []
+
+
 def test_helper_has_no_per_entry_process_spawn() -> None:
     source = HELPER.read_text()
 
     assert "subprocess" not in source
     assert "mountpoint -q" not in source
     assert "os.system" not in source
-    assert "os.fwalk" in source
+    assert "os.fwalk" not in source
+    assert "_open_anchored_root" in source
+    assert "O_NOFOLLOW" in source
+    assert "os.listdir(directory_fd)" in source
+    assert "os.fchown" in source
     assert "dir_fd=directory_fd" in source
     assert "follow_symlinks=False" in source
