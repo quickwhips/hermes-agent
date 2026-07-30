@@ -10954,7 +10954,7 @@ async def _read_session_import_body(request: Request) -> bytes:
 
 
 def _import_sessions_for_profile(profile: Optional[str], sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
-    db = _open_session_db_for_profile(profile)
+    db = _open_session_db_for_profile(profile, read_only=False)
     try:
         return db.import_sessions(sessions)
     finally:
@@ -10986,8 +10986,8 @@ from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-e
 
 
 
-def _open_session_db_for_profile(profile: Optional[str]):
-    """Open a SessionDB for read paths, optionally for another profile.
+def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
+    """Open a SessionDB with an explicit access mode, optionally for another profile.
 
     ``profile`` None/empty → this process's own ``state.db`` (the common,
     single-profile case). A named profile opens that profile's on-disk
@@ -10996,9 +10996,19 @@ def _open_session_db_for_profile(profile: Optional[str]):
     """
     from hermes_state import SessionDB
     if not profile:
-        return SessionDB()
+        return SessionDB(read_only=read_only)
     _name, home = _cron_profile_home(profile)
-    return SessionDB(db_path=Path(home) / "state.db")
+    return SessionDB(db_path=Path(home) / "state.db", read_only=read_only)
+
+
+def _session_db_exists_for_profile(profile: Optional[str]) -> bool:
+    """Check dashboard read availability without creating profile state."""
+    if not profile:
+        from hermes_state import DEFAULT_DB_PATH
+
+        return Path(DEFAULT_DB_PATH).is_file()
+    _name, home = _cron_profile_home(profile)
+    return (Path(home) / "state.db").is_file()
 
 
 # In-process throttle for the opportunistic auto-archive trigger, keyed by
@@ -11030,10 +11040,17 @@ def _maybe_auto_archive_for_profile(db, profile: Optional[str]) -> None:
         cfg = (_load_full_config().get("sessions") or {})
         if not cfg.get("auto_archive", False):
             return
-        db.maybe_auto_archive(
-            idle_days=float(cfg.get("auto_archive_days", 3)),
-            min_interval_hours=int(cfg.get("min_interval_hours", 24)),
-        )
+        own_db = db is None
+        if own_db:
+            db = _open_session_db_for_profile(profile, read_only=False)
+        try:
+            db.maybe_auto_archive(
+                idle_days=float(cfg.get("auto_archive_days", 3)),
+                min_interval_hours=int(cfg.get("min_interval_hours", 24)),
+            )
+        finally:
+            if own_db:
+                db.close()
     except Exception as exc:
         _log.debug("opportunistic auto-archive skipped: %s", exc)
 
@@ -11051,7 +11068,7 @@ async def _auto_archive_ticker_loop(
     """
 
     def _sweep() -> None:
-        db = _open_session_db_for_profile(None)
+        db = _open_session_db_for_profile(None, read_only=False)
         try:
             _maybe_auto_archive_for_profile(db, None)
         finally:
@@ -11103,7 +11120,7 @@ def _prune_sessions(body: SessionPrune):
     if has_window or (_attr_filters_set and not _older_than_explicit):
         _effective_older_than = None
     profile_home = _cron_profile_home(body.profile)[1] if body.profile else get_hermes_home()
-    db = _open_session_db_for_profile(body.profile)
+    db = _open_session_db_for_profile(body.profile, read_only=False)
     try:
         filters = dict(
             older_than_days=_effective_older_than,
@@ -11528,7 +11545,7 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
     except (TypeError, ValueError):
         limit_n = 20
 
-    db = _open_session_db_for_profile(selected)
+    db = _open_session_db_for_profile(selected, read_only=True)
     try:
         runs = db.list_cron_job_runs(canonical, limit=limit_n, offset=0)
         now = time.time()
@@ -13856,7 +13873,7 @@ def _aux_task_summary(aux_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
     from agent.insights import InsightsEngine
 
-    db = _open_session_db_for_profile(profile)
+    db = _open_session_db_for_profile(profile, read_only=True)
     try:
         cutoff = time.time() - (days * 86400)
         cur = db._conn.execute("""
@@ -13945,7 +13962,7 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
     Returns token/cost/session breakdown per model plus capability metadata
     from models.dev (context window, vision, tools, reasoning, etc.).
     """
-    db = _open_session_db_for_profile(profile)
+    db = _open_session_db_for_profile(profile, read_only=True)
     try:
         cutoff = time.time() - (days * 86400)
 
@@ -14588,7 +14605,8 @@ def _resolve_chat_argv(
 
     if resume:
         _resume_db = _open_session_db_for_profile(
-            requested if profile_dir is not None else None
+            requested if profile_dir is not None else None,
+            read_only=True,
         )
         try:
             latest_resume, _latest_path = _session_latest_descendant(resume, _resume_db)
