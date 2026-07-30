@@ -1,7 +1,6 @@
 """Regression tests for symlink-safe Docker stage2 ownership repair."""
 from __future__ import annotations
 
-import os
 import re
 import shutil
 import subprocess
@@ -32,14 +31,25 @@ def _run_helper(
     log_path: Path,
     *,
     hermes_home: Path | None = None,
+    python_exit: int = 0,
 ) -> subprocess.CompletedProcess[str]:
     shell = shutil.which("sh")
     if shell is None:
         pytest.skip("sh not available")
     hermes_home = target if hermes_home is None else hermes_home
+    install_dir = log_path.parent / "install"
+    python = install_dir / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log_path}"\nexit {python_exit}\n'
+    )
+    python.chmod(0o755)
+    (install_dir / "docker").mkdir()
+    (install_dir / "docker" / "chown_hermes_tree.py").touch()
     script = (
         "set -eu\n"
         f'HERMES_HOME="{hermes_home}"\n'
+        f'INSTALL_DIR="{install_dir}"\n'
         "actual_hermes_uid=99\n"
         "actual_hermes_gid=100\n"
         f"{_chown_hermes_tree_function(text)}\n"
@@ -47,53 +57,6 @@ def _run_helper(
         f'chown_hermes_tree "{target}"\n'
     )
     return subprocess.run([shell, "-c", script], capture_output=True, text=True)
-
-
-def _run_real_find_helper(
-    text: str,
-    target: Path,
-    log_path: Path,
-    mountpoint: Path,
-    tmp_path: Path,
-    *,
-    expected_uid: int | None = None,
-    expected_gid: int | None = None,
-    chown_exit: int = 0,
-) -> subprocess.CompletedProcess[str]:
-    shell = shutil.which("sh")
-    if shell is None:
-        pytest.skip("sh not available")
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    fake_mountpoint = bin_dir / "mountpoint"
-    fake_mountpoint.write_text(
-        '#!/bin/sh\n[ "$1" = "-q" ] && [ "$2" = "$FAKE_MOUNTPOINT" ]\n'
-    )
-    fake_mountpoint.chmod(0o755)
-    fake_chown = bin_dir / "chown"
-    fake_chown.write_text(
-        '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CHOWN_LOG"\n'
-        f"exit {chown_exit}\n"
-    )
-    fake_chown.chmod(0o755)
-    expected_uid = os.getuid() + 1 if expected_uid is None else expected_uid
-    expected_gid = os.getgid() + 1 if expected_gid is None else expected_gid
-    script = (
-        "set -eu\n"
-        f'HERMES_HOME="{target}"\n'
-        f"actual_hermes_uid={expected_uid}\n"
-        f"actual_hermes_gid={expected_gid}\n"
-        f"{_chown_hermes_tree_function(text)}\n"
-        f'chown_hermes_tree "{target}"\n'
-    )
-    environment = os.environ | {
-        "CHOWN_LOG": str(log_path),
-        "FAKE_MOUNTPOINT": str(mountpoint),
-        "PATH": f"{bin_dir}:{os.environ['PATH']}",
-    }
-    return subprocess.run(
-        [shell, "-c", script], capture_output=True, text=True, env=environment
-    )
 
 
 def test_chown_helper_repairs_real_directories(stage2_text: str, tmp_path: Path) -> None:
@@ -105,118 +68,23 @@ def test_chown_helper_repairs_real_directories(stage2_text: str, tmp_path: Path)
 
     assert proc.returncode == 0, proc.stderr
     assert log_path.read_text().splitlines() == [
-        f"{target} -xdev ( ! -path {target} -type d -exec mountpoint -q {{}} ; "
-        "-prune ) -o ( ( ! -uid 99 -o ! -gid 100 ) "
-        "-exec chown -h 99:100 {} + )",
+        f"{tmp_path}/install/docker/chown_hermes_tree.py {target} 99 100",
     ]
+    assert "mountpoint" not in log_path.read_text()
 
 
-def test_chown_helper_prunes_nested_mountpoints(
-    stage2_text: str, tmp_path: Path
-) -> None:
-    target = tmp_path / "home"
-    nested_mount = target / "external"
-    nested_mount.mkdir(parents=True)
-    (nested_mount / "foreign-state").write_text("do not touch")
-    (target / "managed-state").write_text("repair")
-    log_path = tmp_path / "chown.log"
-
-    proc = _run_real_find_helper(
-        stage2_text, target, log_path, nested_mount, tmp_path
-    )
-
-    assert proc.returncode == 0, proc.stderr
-    changed_paths = log_path.read_text()
-    assert str(target / "managed-state") in changed_paths
-    assert str(nested_mount) not in changed_paths
-
-
-def test_chown_helper_selects_gid_only_drift(
+def test_chown_helper_is_fail_soft_when_python_helper_fails(
     stage2_text: str, tmp_path: Path
 ) -> None:
     target = tmp_path / "home"
     target.mkdir()
-    state = target / "state"
-    state.write_text("repair group")
-    log_path = tmp_path / "chown.log"
-
-    proc = _run_real_find_helper(
-        stage2_text,
-        target,
-        log_path,
-        tmp_path / "not-mounted",
-        tmp_path,
-        expected_uid=os.getuid(),
-        expected_gid=os.getgid() + 1,
+    proc = _run_helper(
+        stage2_text, target, tmp_path / "chown.log", python_exit=1
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert str(state) in log_path.read_text()
-
-
-def test_chown_helper_does_not_follow_final_symlink(
-    stage2_text: str, tmp_path: Path
-) -> None:
-    target = tmp_path / "home"
-    target.mkdir()
-    external = tmp_path / "external-state"
-    external.write_text("do not follow")
-    link = target / "state-link"
-    try:
-        link.symlink_to(external)
-    except (NotImplementedError, OSError):
-        pytest.skip("symlinks are not available on this platform")
-    log_path = tmp_path / "chown.log"
-
-    proc = _run_real_find_helper(
-        stage2_text, target, log_path, tmp_path / "not-mounted", tmp_path
-    )
-
-    assert proc.returncode == 0, proc.stderr
-    changed_paths = log_path.read_text()
-    assert str(link) in changed_paths
-    assert str(external) not in changed_paths
-
-
-def test_chown_helper_is_fail_soft_when_chown_fails(
-    stage2_text: str, tmp_path: Path
-) -> None:
-    target = tmp_path / "home"
-    target.mkdir()
-    (target / "state").write_text("repair")
-
-    proc = _run_real_find_helper(
-        stage2_text,
-        target,
-        tmp_path / "chown.log",
-        tmp_path / "not-mounted",
-        tmp_path,
-        chown_exit=1,
-    )
-
-    assert proc.returncode == 0, proc.stderr
-
-
-def test_chown_helper_warm_tree_executes_no_chown(
-    stage2_text: str, tmp_path: Path
-) -> None:
-    target = tmp_path / "home"
-    target.mkdir()
-    (target / "state").write_text("already owned")
-    log_path = tmp_path / "chown.log"
-
-    proc = _run_real_find_helper(
-        stage2_text,
-        target,
-        log_path,
-        tmp_path / "not-mounted",
-        tmp_path,
-        expected_uid=os.getuid(),
-        expected_gid=os.getgid(),
-    )
-
-    assert proc.returncode == 0, proc.stderr
-    assert not log_path.exists()
+    assert "chown" in proc.stdout
+    assert "continuing" in proc.stdout
 
 
 def test_chown_helper_refuses_symlinked_directories(stage2_text: str, tmp_path: Path) -> None:
@@ -267,15 +135,15 @@ def test_stage2_uses_symlink_safe_helper_for_hermes_home_trees(stage2_text: str)
     assert 'chown_hermes_tree "$HERMES_HOME/$sub"' in stage2_text
     assert 'chown_hermes_tree "$HERMES_HOME/profiles"' in stage2_text
     assert 'chown_hermes_tree "$HERMES_HOME/cron"' in stage2_text
-    assert 'find "$target" -xdev' in helper
-    assert '! -path "$target" -type d -exec mountpoint -q {} \\; -prune' in helper
-    assert '! -uid "$actual_hermes_uid" -o ! -gid "$actual_hermes_gid"' in helper
-    assert '-exec chown -h "$actual_hermes_uid:$actual_hermes_gid" {} +' in helper
+    assert '"$INSTALL_DIR/docker/chown_hermes_tree.py"' in helper
+    assert '"$target" "$actual_hermes_uid" "$actual_hermes_gid"' in helper
+    assert "mountpoint" not in helper
+    assert "find " not in helper
     assert "chown -R" not in helper
     assert 'chown -R hermes:hermes "$HERMES_HOME/$sub"' not in stage2_text
     assert 'chown -R hermes:hermes "$HERMES_HOME/profiles"' not in stage2_text
     assert 'chown -R hermes:hermes "$HERMES_HOME/cron"' not in stage2_text
-    assert "xz-utils util-linux" in (REPO_ROOT / "Dockerfile").read_text()
+    assert "xz-utils util-linux" not in (REPO_ROOT / "Dockerfile").read_text()
 
 
 def test_stage2_skips_top_level_chown_for_symlinked_hermes_home(
