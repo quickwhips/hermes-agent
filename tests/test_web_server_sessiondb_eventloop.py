@@ -1,100 +1,101 @@
-import ast
+from __future__ import annotations
+
 import asyncio
+import inspect
 import threading
-from pathlib import Path
+
+import pytest
 
 from hermes_cli import web_server
-from hermes_cli.web_routers import sessions as web_sessions
 
 
-TARGET_HANDLERS = {
-    "bulk_delete_sessions_endpoint",
-    "count_empty_sessions_endpoint",
-    "delete_empty_sessions_endpoint",
-    "get_session_latest_descendant",
-    "get_session_messages",
-    "delete_session_endpoint",
-    "export_session_endpoint",
-    "prune_sessions_endpoint",
-    "get_usage_analytics",
-    "get_models_analytics",
-}
+class _OpenMarker(RuntimeError):
+    pass
 
 
-def _call_name(call: ast.Call) -> str | None:
-    if isinstance(call.func, ast.Name):
-        return call.func.id
-    if isinstance(call.func, ast.Attribute):
-        return call.func.attr
-    return None
+def _session_handler_cases():
+    return [
+        ("search", True, lambda: web_server.search_sessions(q="needle")),
+        (
+            "bulk delete",
+            False,
+            lambda: web_server.bulk_delete_sessions_endpoint(
+                web_server.BulkDeleteSessions(ids=["session-id"])
+            ),
+        ),
+        ("count empty", True, lambda: web_server.count_empty_sessions_endpoint()),
+        ("delete empty", False, lambda: web_server.delete_empty_sessions_endpoint()),
+        ("stats", True, lambda: web_server.get_session_stats()),
+        ("detail", True, lambda: web_server.get_session_detail("session-id")),
+        (
+            "latest descendant",
+            True,
+            lambda: web_server.get_session_latest_descendant("session-id"),
+        ),
+        (
+            "messages",
+            True,
+            lambda: web_server.get_session_messages("session-id"),
+        ),
+        (
+            "delete",
+            False,
+            lambda: web_server.delete_session_endpoint("session-id"),
+        ),
+        (
+            "rename",
+            False,
+            lambda: web_server.rename_session_endpoint(
+                "session-id", web_server.SessionRename(title="new title")
+            ),
+        ),
+        (
+            "export",
+            True,
+            lambda: web_server.export_session_endpoint("session-id"),
+        ),
+        (
+            "prune",
+            False,
+            lambda: web_server.prune_sessions_endpoint(web_server.SessionPrune()),
+        ),
+        ("usage analytics", True, lambda: web_server.get_usage_analytics()),
+        ("model analytics", True, lambda: web_server.get_models_analytics()),
+    ]
 
 
-def test_sessiondb_handlers_open_connections_inside_executor_helpers():
-    # The session route handlers were extracted to web_routers/sessions.py
-    # (wave 2); the analytics handlers and the executor helpers still live in
-    # web_server.py — scan both modules' top-level bodies.
-    handlers: dict[str, ast.AsyncFunctionDef] = {}
-    top_level_helpers: dict[str, ast.FunctionDef] = {}
-    for mod in (web_server, web_sessions):
-        tree = ast.parse(Path(mod.__file__).read_text(encoding="utf-8"))
-        for node in tree.body:
-            if isinstance(node, ast.AsyncFunctionDef) and node.name in TARGET_HANDLERS:
-                handlers[node.name] = node
-            elif isinstance(node, ast.FunctionDef):
-                top_level_helpers[node.name] = node
-    assert handlers.keys() == TARGET_HANDLERS
+def test_sessiondb_profile_helper_requires_explicit_keyword_only_access_mode():
+    parameter = inspect.signature(
+        web_server._open_session_db_for_profile
+    ).parameters["read_only"]
 
-    for name, handler in handlers.items():
-        helpers = {
-            **top_level_helpers,
-            **{
-                node.name: node
-                for node in handler.body
-                if isinstance(node, ast.FunctionDef)
-            },
-        }
-        offloaded = {
-            arg.id
-            for node in ast.walk(handler)
-            if isinstance(node, ast.Call)
-            and _call_name(node) == "to_thread"
-            for arg in node.args[:1]
-            if isinstance(arg, ast.Name)
-        }
-        db_open_owners = {
-            helper_name
-            for helper_name, helper in helpers.items()
-            if helper_name in offloaded
-            and any(
-                isinstance(node, ast.Call)
-                and _call_name(node) == "_open_session_db_for_profile"
-                for node in ast.walk(helper)
-            )
-        }
-        assert db_open_owners, f"{name} does not offload SessionDB open + work"
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
 
 
-def test_bulk_delete_sessiondb_work_runs_off_event_loop(monkeypatch):
+@pytest.mark.parametrize(
+    ("name", "expected_read_only", "invoke"),
+    _session_handler_cases(),
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_async_sessiondb_handlers_offload_declared_access_mode(
+    monkeypatch, name, expected_read_only, invoke
+):
     loop_thread = threading.get_ident()
-    db_threads: list[int] = []
+    observed: list[tuple[int, bool]] = []
 
-    class _DB:
-        def delete_sessions(self, ids):
-            db_threads.append(threading.get_ident())
-            assert ids == ["one", "two"]
-            return 2
+    def _open(profile=None, *, read_only):
+        observed.append((threading.get_ident(), read_only))
+        raise _OpenMarker(name)
 
-        def close(self):
-            db_threads.append(threading.get_ident())
+    monkeypatch.setattr(web_server, "_open_session_db_for_profile", _open)
+    monkeypatch.setattr(web_server, "_session_db_exists_for_profile", lambda profile=None: True)
 
-    monkeypatch.setattr(web_server, "_open_session_db_for_profile", lambda profile=None: _DB())
+    try:
+        asyncio.run(invoke())
+    except (Exception, BaseExceptionGroup):
+        pass
 
-    result = asyncio.run(
-        web_server.bulk_delete_sessions_endpoint(
-            web_server.BulkDeleteSessions(ids=["one", "two"])
-        )
-    )
-
-    assert result == {"ok": True, "deleted": 2}
-    assert db_threads
-    assert all(thread_id != loop_thread for thread_id in db_threads)
+    assert observed, f"{name} did not open SessionDB"
+    assert {mode for _, mode in observed} == {expected_read_only}
+    assert all(thread_id != loop_thread for thread_id, _ in observed)

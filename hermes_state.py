@@ -1606,6 +1606,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                # Capability probes must remain SELECT-only: dashboard search
+                # needs an existing FTS table, but read-only handles must never
+                # run _init_schema() to create/repair it.
+                self._fts_enabled = bool(self._conn.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'messages_fts'"
+                ).fetchone())
+                self._trigram_available = bool(self._conn.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'messages_fts_trigram'"
+                ).fetchone())
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2225,7 +2236,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._lock:
             if self._conn:
                 try:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    if not self.read_only:
+                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 except Exception as exc:
                     logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
                 self._conn.close()

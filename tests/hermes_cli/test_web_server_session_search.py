@@ -12,6 +12,9 @@ class _FakeSessionDB:
     own lineage root.
     """
 
+    def __init__(self, *_, **__):
+        pass
+
     closed = False
 
     @staticmethod
@@ -94,6 +97,7 @@ class _FakeSessionDB:
 
 def test_desktop_session_search_merges_id_matches_before_content_matches(monkeypatch):
     monkeypatch.setattr("hermes_state.SessionDB", _FakeSessionDB)
+    monkeypatch.setattr(web_server, "_session_db_exists_for_profile", lambda profile=None: True)
 
     response = asyncio.run(web_server.search_sessions(q="20260603", limit=2))
 
