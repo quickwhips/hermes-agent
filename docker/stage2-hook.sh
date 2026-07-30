@@ -217,12 +217,20 @@ chown_hermes_tree() {
     if refuse_symlinked_path "recursive chown" "$target"; then
         return 0
     fi
+    if [ ! -r /proc/self/mountinfo ] || ! command -v mountpoint >/dev/null 2>&1; then
+        echo "[stage2] Warning: cannot prove mount boundaries for $target — continuing"
+        return 0
+    fi
     # Large persistent profile trees may already contain millions of correctly
     # owned entries.  Select only drifted inodes so warm starts do not rewrite
     # every inode.  find's default -P behavior plus chown -h avoids following
-    # a final symlink; -xdev keeps reconciliation inside the managed volume.
-    find "$target" -xdev \( ! -uid "$actual_hermes_uid" -o ! -gid "$actual_hermes_gid" \) \
-        -exec chown -h "$actual_hermes_uid:$actual_hermes_gid" {} + 2>/dev/null || \
+    # a final symlink.  -xdev prevents descent into another filesystem, while
+    # the mountpoint prune also excludes the nested mount root itself and
+    # same-device bind mounts from ownership changes.
+    find "$target" -xdev \
+        \( ! -path "$target" -type d -exec mountpoint -q {} \; -prune \) -o \
+        \( \( ! -uid "$actual_hermes_uid" -o ! -gid "$actual_hermes_gid" \) \
+        -exec chown -h "$actual_hermes_uid:$actual_hermes_gid" {} + \) 2>/dev/null || \
         echo "[stage2] Warning: chown $target failed (rootless container?) — continuing"
 }
 
