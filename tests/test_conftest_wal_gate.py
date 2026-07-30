@@ -75,3 +75,10 @@ def test_conftest_does_not_import_hermes_state_at_collection():
         if saved is not None:
             sys.modules["hermes_state"] = saved
     assert not blocked
+
+
+def test_conftest_stubs_live_runtime_repair():
+    """Unrelated tests must never replace the checkout's active virtualenv."""
+    from hermes_cli import managed_uv
+
+    assert managed_uv.repair_vulnerable_runtime.__name__ == "_blocked_runtime_repair"

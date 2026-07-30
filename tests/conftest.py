@@ -698,6 +698,33 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
 
 
 @pytest.fixture(autouse=True)
+def _runtime_repair_guard(request, monkeypatch):
+    """Prevent unrelated tests from replacing the checkout's live virtualenv.
+
+    ``ensure_uv`` performs SQLite runtime repair as a side effect. The CI
+    checkout intentionally links a vulnerable SQLite build, so an unmocked
+    call can atomically replace ``.venv`` while parallel pytest subprocesses
+    are still using it. Tests for the repair implementation use isolated
+    temporary environments and opt out by living in ``test_managed_uv.py``.
+    """
+    if request.node.path.name == "test_managed_uv.py":
+        yield
+        return
+
+    from hermes_cli import managed_uv
+
+    def _blocked_runtime_repair(*_args, **_kwargs):
+        return managed_uv.RuntimeRepairResult("not-applicable")
+
+    monkeypatch.setattr(
+        managed_uv,
+        "repair_vulnerable_runtime",
+        _blocked_runtime_repair,
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _live_system_guard(request, monkeypatch):
     """Block real os.kill / systemctl / gateway-pid scans during tests.
 
