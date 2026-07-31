@@ -9,8 +9,11 @@ from collections.abc import Iterable
 from pathlib import Path
 
 _MOUNT_ESCAPE = re.compile(r"\\(040|011|012|134)")
-_MOUNT_DEVICE = re.compile(r"[0-9]+:[0-9]+")
-_MOUNT_OPTIONAL = re.compile(r"(?:shared|master|propagate_from):[0-9]+|unbindable")
+_MOUNT_ID = re.compile(r"[1-9][0-9]*")
+_MOUNT_DEVICE = re.compile(r"(?:0|[1-9][0-9]*):(?:0|[1-9][0-9]*)")
+_MOUNT_OPTIONAL = re.compile(
+    r"(?:shared|master|propagate_from):[1-9][0-9]*|unbindable"
+)
 _MOUNT_DECODE = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
@@ -52,8 +55,8 @@ def _mountpoints(path: Path) -> frozenset[str]:
             if (
                 len(fields) < 10
                 or fields.count("-") != 1
-                or not fields[0].isdigit()
-                or not fields[1].isdigit()
+                or _MOUNT_ID.fullmatch(fields[0]) is None
+                or _MOUNT_ID.fullmatch(fields[1]) is None
                 or _MOUNT_DEVICE.fullmatch(fields[2]) is None
                 or not fields[3].startswith("/")
                 or not fields[4].startswith("/")
@@ -86,17 +89,25 @@ def _mountpoints(path: Path) -> frozenset[str]:
     return frozenset(points)
 
 
-def _repair_entry(
+def _open_matching_entry(
     name: str,
     entry_stat: os.stat_result,
-    uid: int,
-    gid: int,
     *,
     dir_fd: int,
-) -> None:
-    if entry_stat.st_uid == uid and entry_stat.st_gid == gid:
-        return
-    os.chown(name, uid, gid, dir_fd=dir_fd, follow_symlinks=False)
+    flags: int,
+) -> tuple[int, os.stat_result]:
+    descriptor = os.open(name, flags, dir_fd=dir_fd)
+    try:
+        opened_stat = os.fstat(descriptor)
+        if (entry_stat.st_dev, entry_stat.st_ino) != (
+            opened_stat.st_dev,
+            opened_stat.st_ino,
+        ):
+            raise OSError(f"ownership target changed during traversal: {name}")
+        return descriptor, opened_stat
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _open_anchored_root(target: str) -> int:
@@ -188,15 +199,36 @@ def repair_tree(
                     if full_path in nested_mounts or entry_stat.st_dev != root_device:
                         continue
                     if not stat.S_ISDIR(entry_stat.st_mode):
-                        _repair_entry(name, entry_stat, uid, gid, dir_fd=directory_fd)
+                        if not stat.S_ISREG(entry_stat.st_mode):
+                            continue
+                        try:
+                            leaf_fd, leaf_stat = _open_matching_entry(
+                                name,
+                                entry_stat,
+                                dir_fd=directory_fd,
+                                flags=_FILE_FLAGS,
+                            )
+                        except FileNotFoundError:
+                            continue
+                        try:
+                            if leaf_stat.st_dev != root_device:
+                                continue
+                            if leaf_stat.st_uid != uid or leaf_stat.st_gid != gid:
+                                os.fchown(leaf_fd, uid, gid)
+                        finally:
+                            os.close(leaf_fd)
                         continue
 
                     try:
-                        child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+                        child_fd, child_stat = _open_matching_entry(
+                            name,
+                            entry_stat,
+                            dir_fd=directory_fd,
+                            flags=_DIRECTORY_FLAGS,
+                        )
                     except FileNotFoundError:
                         continue
                     open_descriptors.add(child_fd)
-                    child_stat = os.fstat(child_fd)
                     if child_stat.st_dev != root_device:
                         os.close(child_fd)
                         open_descriptors.remove(child_fd)

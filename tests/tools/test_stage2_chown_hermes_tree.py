@@ -53,7 +53,8 @@ def _record_chown(monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> list[t
         calls.append((path, dir_fd, follow_symlinks))
 
     def fake_fchown(descriptor: int, _uid: int, _gid: int) -> None:
-        calls.append((f"fd:{descriptor}", descriptor, False))
+        resolved = Path(os.readlink(f"/proc/self/fd/{descriptor}")).name
+        calls.append((resolved, descriptor, False))
 
     monkeypatch.setattr(module.os, "chown", fake_chown)
     monkeypatch.setattr(module.os, "fchown", fake_fchown)
@@ -133,7 +134,7 @@ def test_repair_tree_selects_gid_only_drift(
     assert state_calls[0][2] is False
 
 
-def test_repair_tree_chowns_final_symlink_without_following_target(
+def test_repair_tree_skips_final_symlink_and_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _load_helper()
@@ -156,7 +157,7 @@ def test_repair_tree_chowns_final_symlink_without_following_target(
     )
 
     changed = {str(path) for path, _dir_fd, _follow in calls}
-    assert "state-link" in changed
+    assert "state-link" not in changed
     assert str(external) not in changed
     assert all(follow is False for _path, _dir_fd, follow in calls)
 
@@ -207,9 +208,20 @@ def test_repair_tree_rejects_malformed_mountinfo_before_chown(
         "1 2 0:1 / /fake rw\n",
         "1 2 0:1 / /fake rw - ext4\n",
         "1  2 0:1 / /fake rw - ext4 /dev/root rw\n",
+        "١ 2 0:1 / /fake rw - ext4 /dev/root rw\n",
+        "01 2 0:1 / /fake rw - ext4 /dev/root rw\n",
+        "1 2 00:01 / /fake rw - ext4 /dev/root rw\n",
         "\n",
     ],
-    ids=["missing_separator", "missing_post_fields", "double_space", "blank"],
+    ids=[
+        "missing_separator",
+        "missing_post_fields",
+        "double_space",
+        "unicode_mount_id",
+        "leading_zero_mount_id",
+        "leading_zero_device",
+        "blank",
+    ],
 )
 def test_structurally_malformed_mountinfo_fails_before_any_chown(
     record: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -270,7 +282,7 @@ def test_repair_path_repairs_directory_and_regular_file_by_fd(
     module.repair_path(state_file, os.getuid() + 1, os.getgid() + 1)
 
     assert len(calls) == 2
-    assert all(str(path).startswith("fd:") for path, _fd, _follow in calls)
+    assert {path for path, _fd, _follow in calls} == {"gateways", "state.db"}
 
 
 def test_repair_path_rejects_intermediate_and_final_symlinks_before_chown(
@@ -359,3 +371,94 @@ def test_helper_has_no_per_entry_process_spawn() -> None:
     assert "os.fchown" in source
     assert "dir_fd=directory_fd" in source
     assert "follow_symlinks=False" in source
+
+
+def _drifting_stat(
+    module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_name: str,
+) -> None:
+    original_stat = module.os.stat
+
+    def fake_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        result = original_stat(path, *args, **kwargs)
+        if path == entry_name and kwargs.get("dir_fd") is not None:
+            values = list(result)
+            values[4] = os.getuid() + 1
+            values[5] = os.getgid() + 1
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(module.os, "stat", fake_stat)
+
+
+def test_repair_tree_rejects_regular_file_inode_swap_before_chown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    target = tmp_path / "home"
+    target.mkdir()
+    leaf = target / "state"
+    leaf.write_text("original")
+    _drifting_stat(module, monkeypatch, "state")
+    original_open = module.os.open
+    swapped = False
+
+    def swapping_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        if path == "state" and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            leaf.unlink()
+            leaf.write_text("replacement")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "open", swapping_open)
+    calls = _record_chown(monkeypatch, module)
+
+    with pytest.raises(OSError, match="changed during traversal"):
+        module.repair_tree(
+            target,
+            os.getuid(),
+            os.getgid(),
+            mountinfo_path=_mountinfo(tmp_path / "mountinfo", target),
+        )
+
+    assert swapped is True
+    assert calls == []
+
+
+def test_repair_tree_rejects_directory_inode_swap_before_chown_or_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    target = tmp_path / "home"
+    child = target / "child"
+    child.mkdir(parents=True)
+    (child / "original").write_text("original")
+    stale = target / "stale-child"
+    _drifting_stat(module, monkeypatch, "child")
+    original_open = module.os.open
+    swapped = False
+
+    def swapping_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        if path == "child" and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            child.rename(stale)
+            child.mkdir()
+            (child / "replacement").write_text("replacement")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "open", swapping_open)
+    calls = _record_chown(monkeypatch, module)
+
+    with pytest.raises(OSError, match="changed during traversal"):
+        module.repair_tree(
+            target,
+            os.getuid(),
+            os.getgid(),
+            mountinfo_path=_mountinfo(tmp_path / "mountinfo", target),
+        )
+
+    assert swapped is True
+    assert calls == []
