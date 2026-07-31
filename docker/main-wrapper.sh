@@ -49,6 +49,16 @@ EOF
     exit 1
 fi
 
+# The Docker CMD is s6's main program, not a static longrun.  Do not execute
+# any user payload until this boot's stage2 and supervise-permission hooks have
+# both committed readiness, even if an operator weakens s6's failure policy.
+. /opt/hermes/docker/init_status.sh
+BOOT_TOKEN=$(hermes_current_boot_token) || exit 1
+until hermes_status_is_ready /run/hermes-stage2-status "$BOOT_TOKEN" && \
+        hermes_status_is_ready /run/hermes-supervise-perms-status "$BOOT_TOKEN"; do
+    sleep 0.05
+done
+
 # HOME comes through with-contenv as /root (the /init context). Override
 # to the hermes user's home before dropping privileges so libraries that
 # resolve paths via $HOME (e.g. discord lockfile under XDG_STATE_HOME)
