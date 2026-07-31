@@ -18,6 +18,7 @@
 set -eu
 
 HERMES_HOME="${HERMES_HOME:-/opt/data}"
+HERMES_WRITE_SAFE_ROOT="${HERMES_WRITE_SAFE_ROOT:-}"
 INSTALL_DIR="/opt/hermes"
 
 # Drop to hermes via s6-setuidgid, but skip it when already non-root.
@@ -83,7 +84,7 @@ fi
 # `mkdir: cannot create directory '/...': Permission denied`. Idempotent — `mkdir -p`
 # is a no-op if the dir already exists. (#18482, salvages #18488)
 if ! "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/docker/chown_hermes_tree.py" \
-    --validate-root "$HERMES_HOME"; then
+    --validate-root "$HERMES_HOME" --safe-roots "$HERMES_WRITE_SAFE_ROOT"; then
     echo "[stage2] ERROR: refusing unsafe HERMES_HOME ownership authority: $HERMES_HOME" >&2
     exit 1
 fi

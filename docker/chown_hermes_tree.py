@@ -34,7 +34,11 @@ _SYS_OPENAT2 = 437
 _RESOLVE_NO_XDEV = 0x01
 _RESOLVE_NO_SYMLINKS = 0x04
 _RESOLVE_BENEATH = 0x08
-_ALLOWED_DATA_ROOTS = (Path("/opt/data"), Path("/home/hermes/.hermes"))
+_PROTECTED_ROOTS = tuple(
+    Path(value)
+    for value in ("/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc", "/root", "/run", "/sbin", "/sys", "/usr", "/var")
+)
+_INSTALL_ROOT = Path("/opt/hermes")
 
 
 class _OpenHow(ctypes.Structure):
@@ -155,13 +159,24 @@ def _relative_to_root(target: Path, root: Path) -> tuple[str, str]:
     return root_text, relative
 
 
-def validate_root_policy(value: str) -> Path:
+def validate_root_policy(value: str, safe_roots: str) -> Path:
     """Validate stage2's root-owned mutation authority before any writes."""
     if not value.startswith("/") or posixpath.normpath(value) != value:
         raise ValueError("HERMES_HOME must be an absolute canonical data-root path")
     root = Path(value)
-    if not any(root == allowed or root.is_relative_to(allowed) for allowed in _ALLOWED_DATA_ROOTS):
-        raise ValueError("HERMES_HOME is outside the supported container data roots")
+    if root == Path("/") or root.is_relative_to(_INSTALL_ROOT) or _INSTALL_ROOT.is_relative_to(root):
+        raise ValueError("HERMES_HOME overlaps a protected container path")
+    if any(root == protected or root.is_relative_to(protected) for protected in _PROTECTED_ROOTS):
+        raise ValueError("HERMES_HOME overlaps a protected container path")
+    accepted: set[Path] = set()
+    for entry in safe_roots.split(os.pathsep):
+        if not entry:
+            continue
+        if not entry.startswith("/") or posixpath.normpath(entry) != entry:
+            raise ValueError("HERMES_HOME requires canonical HERMES_WRITE_SAFE_ROOT entries")
+        accepted.add(Path(entry))
+    if root not in accepted:
+        raise ValueError("HERMES_HOME must exactly match a HERMES_WRITE_SAFE_ROOT entry")
     return root
 
 
@@ -284,6 +299,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", type=lambda value: int(value, 8))
     parser.add_argument("--root", type=Path)
     parser.add_argument("--validate-root", metavar="HERMES_HOME")
+    parser.add_argument("--safe-roots", metavar="HERMES_WRITE_SAFE_ROOT")
     parser.add_argument("target", nargs="?", type=Path)
     parser.add_argument("uid", nargs="?", type=int)
     parser.add_argument("gid", nargs="?", type=int)
@@ -294,12 +310,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     if args.validate_root is not None:
+        if args.safe_roots is None:
+            parser.error("--validate-root requires --safe-roots")
         if args.single or args.mode is not None or args.root is not None or any(
             value is not None for value in (args.target, args.uid, args.gid)
         ):
             parser.error("--validate-root cannot be combined with ownership repair")
-        validate_root_policy(args.validate_root)
+        validate_root_policy(args.validate_root, args.safe_roots)
         return 0
+    if args.safe_roots is not None:
+        parser.error("--safe-roots requires --validate-root")
     if args.root is None or args.target is None or args.uid is None or args.gid is None:
         parser.error("ownership repair requires --root, target, uid, and gid")
     if args.uid < 0 or args.gid < 0:

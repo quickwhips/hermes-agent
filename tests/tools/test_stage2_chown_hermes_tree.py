@@ -43,42 +43,54 @@ def _mountinfo(path: Path, *mountpoints: Path) -> Path:
 
 
 @pytest.mark.parametrize(
-    "value",
+    ("value", "safe_roots"),
     [
-        "/",
-        "/opt/data/..",
-        "/opt/hermes",
-        "/opt/hermes/runtime",
-        "/etc/hermes",
-        "/tmp/hermes",
-        "relative/hermes",
+        ("/", "/"),
+        ("/opt/data/..", "/opt"),
+        ("/opt/hermes", "/opt/hermes"),
+        ("/opt/hermes/runtime", "/opt/hermes/runtime"),
+        ("/etc/hermes", "/etc/hermes"),
+        ("/tmp/hermes", "/opt/data"),
+        ("relative/hermes", "relative/hermes"),
+        ("/opt/data", "/opt/data/.."),
     ],
 )
-def test_root_policy_rejects_noncanonical_or_untrusted_authority(value: str) -> None:
+def test_root_policy_rejects_noncanonical_or_untrusted_authority(
+    value: str, safe_roots: str
+) -> None:
     module = _load_helper()
 
     with pytest.raises(ValueError, match="HERMES_HOME"):
-        module.validate_root_policy(value)
+        module.validate_root_policy(value, safe_roots)
 
 
 @pytest.mark.parametrize(
-    "value",
+    ("value", "safe_roots"),
     [
-        "/opt/data",
-        "/opt/data/profiles/operator",
-        "/home/hermes/.hermes",
-        "/home/hermes/.hermes/profiles/operator",
+        ("/opt/data", "/opt/data"),
+        ("/home/hermes/.hermes", "/home/hermes/.hermes"),
+        ("/config/hermes", "/workspace:/config/hermes"),
+        ("/tmp/hermes-test", "/tmp/hermes-test:/workspace"),
     ],
 )
-def test_root_policy_accepts_only_explicit_container_data_roots(value: str) -> None:
+def test_root_policy_accepts_explicit_canonical_safe_root(
+    value: str, safe_roots: str
+) -> None:
     module = _load_helper()
 
-    assert module.validate_root_policy(value) == Path(value)
+    assert module.validate_root_policy(value, safe_roots) == Path(value)
 
 
 def test_validate_root_cli_fails_before_ownership_repair() -> None:
     result = subprocess.run(
-        [sys.executable, str(HELPER), "--validate-root", "/opt/hermes"],
+        [
+            sys.executable,
+            str(HELPER),
+            "--validate-root",
+            "/opt/hermes",
+            "--safe-roots",
+            "/opt/hermes",
+        ],
         capture_output=True,
         text=True,
         check=False,
