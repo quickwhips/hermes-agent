@@ -94,9 +94,13 @@ class SessionPortabilityMixin:
         """
         if self._legacy_read_compat:
             prefix = f"cron_{job_id}_"
-            return [row for row in self._legacy_read_sessions(
-                source="cron", limit=limit, offset=offset, include_archived=True
-            ) if str(row.get("id") or "").startswith(prefix)]
+            return self._legacy_read_sessions(
+                source="cron",
+                id_prefix=prefix,
+                limit=limit,
+                offset=offset,
+                include_archived=True,
+            )
         prefix = f"cron_{job_id}_"
         # Half-open upper bound for an index range scan: increment the final
         # byte of the prefix so the range covers exactly the ids that start
