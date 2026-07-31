@@ -1754,7 +1754,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def _legacy_read_sessions(self, *, source=None, sources=None, exclude_sources=None,
                               limit=20, offset=0, include_archived=False,
-                              archived_only=False, **_ignored):
+                              archived_only=False, id_prefix=None, **_ignored):
         """Bounded old-schema list projection; never assumes optional fields."""
         where, params = [], []
         if source or sources:
@@ -1765,11 +1765,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if exclude_sources and self._has_column("sessions", "source"):
             where.append(f"COALESCE(s.source, 'cli') NOT IN ({','.join('?' for _ in exclude_sources)})")
             params.extend(exclude_sources)
+        if archived_only and not self._has_column("sessions", "archived"):
+            return []
         if self._has_column("sessions", "archived"):
             if archived_only:
                 where.append("s.archived = 1")
             elif not include_archived:
                 where.append("COALESCE(s.archived, 0) = 0")
+        if id_prefix:
+            prefix_hi = id_prefix[:-1] + chr(ord(id_prefix[-1]) + 1)
+            where.append("s.id >= ? AND s.id < ?")
+            params.extend((id_prefix, prefix_hi))
         last_active = "COALESCE((SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id=s.id), s.started_at)"
         sql = f"SELECT s.*, {last_active} AS last_active FROM sessions s"
         if where:

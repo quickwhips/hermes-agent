@@ -48,6 +48,7 @@ def test_read_only_legacy_schema_serves_dashboard_reads_without_schema_writes(tm
         assert db.get_messages("legacy-session")[0]["content"] == "legacy needle transcript"
         assert db.search_messages("needle")[0]["session_id"] == "legacy-session"
         assert db.export_session("legacy-session")["messages"][0]["id"] == 1
+        assert db.session_count(archived_only=True) == 0
     finally:
         db.close()
     assert db_path.read_bytes() == before
@@ -60,6 +61,47 @@ def test_read_only_legacy_schema_serves_dashboard_reads_without_schema_writes(tm
     assert asyncio.run(web_server.get_session_stats())["total"] == 1
     assert web_server._get_usage_analytics(days=7)["daily"] == []
     assert web_server._get_models_analytics(days=7)["models"] == []
+
+
+def test_legacy_search_honors_excluded_sources(tmp_path):
+    db_path = tmp_path / "state.db"
+    _seed_legacy_session(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-cli", "cli", "legacy-model", "CLI", 1002, None),
+        )
+        conn.execute(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
+            (2, "legacy-cli", "user", "legacy needle transcript", 1003),
+        )
+    db = SessionDB(db_path=db_path, read_only=True)
+    try:
+        results = db.search_messages("needle", exclude_sources=["cron"])
+    finally:
+        db.close()
+    assert [row["session_id"] for row in results] == ["legacy-cli"]
+
+
+def test_legacy_cron_run_pagination_filters_before_limit(tmp_path):
+    db_path = tmp_path / "state.db"
+    _seed_legacy_session(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM messages")
+        conn.execute("DELETE FROM sessions")
+        conn.executemany(
+            "INSERT INTO sessions VALUES (?, 'cron', 'legacy-model', ?, ?, NULL)",
+            [
+                ("cron_job_b_200", "B", 2000),
+                ("cron_job_a_100", "A", 1000),
+            ],
+        )
+    db = SessionDB(db_path=db_path, read_only=True)
+    try:
+        runs = db.list_cron_job_runs("job_a", limit=1)
+    finally:
+        db.close()
+    assert [row["id"] for row in runs] == ["cron_job_a_100"]
 
 
 def test_search_read_runs_off_event_loop_and_closes(monkeypatch):

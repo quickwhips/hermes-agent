@@ -1124,6 +1124,9 @@ class SessionSearchMixin:
             if source_filter and self._has_column("sessions", "source"):
                 where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
                 params.extend(source_filter)
+            if exclude_sources and self._has_column("sessions", "source"):
+                where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+                params.extend(exclude_sources)
             if role_filter:
                 where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                 params.extend(role_filter)
