@@ -5,6 +5,7 @@ import argparse
 import ctypes
 import errno
 import os
+import posixpath
 import re
 import stat
 from collections.abc import Sequence
@@ -33,6 +34,11 @@ _SYS_OPENAT2 = 437
 _RESOLVE_NO_XDEV = 0x01
 _RESOLVE_NO_SYMLINKS = 0x04
 _RESOLVE_BENEATH = 0x08
+_PROTECTED_ROOTS = tuple(
+    Path(value)
+    for value in ("/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc", "/root", "/run", "/sbin", "/sys", "/usr", "/var")
+)
+_INSTALL_ROOT = Path("/opt/hermes")
 
 
 class _OpenHow(ctypes.Structure):
@@ -143,32 +149,159 @@ def _open_anchored_root(target: str) -> int:
     return descriptor
 
 
-def _open_anchored_parent(target: str) -> tuple[int, str]:
-    parts = Path(target).parts
-    if len(parts) < 2:
-        raise ValueError("ownership path must name an entry below root")
-    descriptor = os.open("/", _DIRECTORY_FLAGS)
+def _relative_to_root(target: Path, root: Path) -> tuple[str, str]:
+    """Return absolute lexical paths after rejecting targets outside ``root``."""
+    root_text = os.path.abspath(os.fspath(root))
+    target_text = os.path.abspath(os.fspath(target))
+    relative = os.path.relpath(target_text, root_text)
+    if relative == os.pardir or relative.startswith(f"{os.pardir}{os.sep}"):
+        raise ValueError("ownership target is outside configured root")
+    return root_text, relative
+
+
+def validate_root_policy(value: str, safe_roots: str) -> Path:
+    """Validate stage2's root-owned mutation authority before any writes."""
+    if (
+        not value.startswith("/")
+        or value.startswith("//")
+        or posixpath.normpath(value) != value
+        or any(not character.isprintable() for character in value)
+    ):
+        raise ValueError("HERMES_HOME must be an absolute canonical data-root path")
+    root = Path(value)
+    if root == Path("/") or root.is_relative_to(_INSTALL_ROOT) or _INSTALL_ROOT.is_relative_to(root):
+        raise ValueError("HERMES_HOME overlaps a protected container path")
+    if any(root == protected or root.is_relative_to(protected) for protected in _PROTECTED_ROOTS):
+        raise ValueError("HERMES_HOME overlaps a protected container path")
+    accepted: set[Path] = set()
+    for entry in safe_roots.split(os.pathsep):
+        if not entry:
+            continue
+        if (
+            not entry.startswith("/")
+            or entry.startswith("//")
+            or posixpath.normpath(entry) != entry
+            or any(not character.isprintable() for character in entry)
+        ):
+            raise ValueError("HERMES_HOME requires canonical HERMES_WRITE_SAFE_ROOT entries")
+        accepted.add(Path(entry))
+    if root not in accepted:
+        raise ValueError("HERMES_HOME must exactly match a HERMES_WRITE_SAFE_ROOT entry")
+    return root
+
+
+def _runtime_can_replace_child(metadata: os.stat_result, runtime_uid: int) -> bool:
+    mode = stat.S_IMODE(metadata.st_mode)
+    return bool(
+        metadata.st_uid == runtime_uid
+        or mode & stat.S_IWGRP
+        or mode & stat.S_IWOTH
+    )
+
+
+def _has_access_acl(descriptor: int) -> bool:
+    """Return whether an opened directory carries a POSIX access ACL."""
     try:
-        for component in parts[1:-1]:
-            next_descriptor = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+        os.getxattr(descriptor, "system.posix_acl_access")
+    except OSError as exc:
+        no_acl_errnos = {
+            errno.ENODATA,
+            errno.ENOTSUP,
+            errno.EOPNOTSUPP,
+        }
+        if exc.errno in no_acl_errnos:
+            return False
+        raise
+    return True
+
+
+def _assert_stable_parent(descriptor: int, runtime_uid: int, child: Path) -> None:
+    if _has_access_acl(descriptor):
+        raise OSError(
+            errno.EPERM,
+            "HERMES_HOME has a parent with a POSIX access ACL",
+            str(child),
+        )
+    if _runtime_can_replace_child(os.fstat(descriptor), runtime_uid):
+        raise OSError(
+            errno.EPERM,
+            "HERMES_HOME has a runtime-writable parent",
+            str(child),
+        )
+
+
+def prepare_root(
+    value: str,
+    safe_roots: str,
+    *,
+    runtime_uid: int,
+    runtime_gid: int,
+    mountinfo_path: Path = Path("/proc/self/mountinfo"),
+) -> Path:
+    """Create/open a root whose pathname the runtime identity cannot replace."""
+    if runtime_uid < 1 or runtime_gid < 1:
+        raise ValueError("runtime UID and GID must be positive")
+    root = validate_root_policy(value, safe_roots)
+    mountpoints = _mountpoints(mountinfo_path)
+    descriptor = os.open("/", _DIRECTORY_FLAGS)
+    current = Path("/")
+    try:
+        for component in root.parts[1:]:
+            child = current / component
+            if str(child) not in mountpoints:
+                _assert_stable_parent(descriptor, runtime_uid, child)
+            try:
+                next_descriptor = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o755, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                next_descriptor = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
-    except BaseException:
+            current = child
+    finally:
         os.close(descriptor)
+    return root
+
+
+def _open_target(root_fd: int, relative: str) -> int:
+    """Resolve a target only beneath the already-authorized root descriptor."""
+    if relative == os.curdir:
+        return os.dup(root_fd)
+    descriptor = root_fd
+    opened: int | None = None
+    try:
+        components = Path(relative).parts
+        for component in components[:-1]:
+            opened = _open_beneath(descriptor, component, _DIRECTORY_FLAGS)
+            os.close(descriptor) if descriptor != root_fd else None
+            descriptor = opened
+            opened = None
+        opened = _open_beneath(descriptor, components[-1], _FILE_FLAGS)
+        return opened
+    except BaseException:
+        if opened is not None:
+            os.close(opened)
         raise
-    return descriptor, parts[-1]
+    finally:
+        if descriptor != root_fd:
+            os.close(descriptor)
 
 
-def repair_path(target: Path, uid: int, gid: int, *, mode: int | None = None) -> None:
-    """Repair one directory or regular file through an anchored descriptor."""
-    target_text = os.path.abspath(os.fspath(target))
-    parent_fd, name = _open_anchored_parent(target_text)
+def repair_path(
+    target: Path, uid: int, gid: int, *, root: Path | None = None, mode: int | None = None
+) -> None:
+    """Repair one directory or regular file beneath the trusted root descriptor."""
+    root_text, relative = _relative_to_root(target, target if root is None else root)
+    root_fd = _open_anchored_root(root_text)
     descriptor: int | None = None
     try:
-        descriptor = _open_beneath(parent_fd, name, _FILE_FLAGS)
+        descriptor = _open_target(root_fd, relative)
         opened = os.fstat(descriptor)
         if not stat.S_ISDIR(opened.st_mode) and not stat.S_ISREG(opened.st_mode):
-            raise OSError(f"ownership target changed type during resolution: {target_text}")
+            raise OSError(f"ownership target changed type during resolution: {target}")
         if opened.st_uid != uid or opened.st_gid != gid:
             os.fchown(descriptor, uid, gid)
         if mode is not None:
@@ -176,7 +309,7 @@ def repair_path(target: Path, uid: int, gid: int, *, mode: int | None = None) ->
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        os.close(parent_fd)
+        os.close(root_fd)
 
 
 def repair_tree(
@@ -184,14 +317,21 @@ def repair_tree(
     uid: int,
     gid: int,
     *,
+    root: Path | None = None,
     mountinfo_path: Path = Path("/proc/self/mountinfo"),
 ) -> None:
-    """Repair mismatched entries through anchored directory descriptors."""
-    target_text = os.path.abspath(os.fspath(target))
+    """Repair mismatched entries beneath the trusted root descriptor."""
+    root_text, relative = _relative_to_root(target, target if root is None else root)
     nested_mounts = _mountpoints(mountinfo_path)
-    root_descriptor = _open_anchored_root(target_text)
-    open_descriptors = {root_descriptor}
+    target_text = os.path.abspath(os.fspath(target))
+    if target_text != root_text and target_text in nested_mounts:
+        raise OSError(errno.EXDEV, "ownership target is a nested mount", target_text)
+    root_fd = _open_anchored_root(root_text)
+    root_descriptor: int | None = None
+    open_descriptors: set[int] = set()
     try:
+        root_descriptor = _open_target(root_fd, relative)
+        open_descriptors.add(root_descriptor)
         root_stat = os.fstat(root_descriptor)
         root_device = root_stat.st_dev
         if root_stat.st_uid != uid or root_stat.st_gid != gid:
@@ -236,20 +376,47 @@ def repair_tree(
     finally:
         for descriptor in open_descriptors:
             os.close(descriptor)
+        os.close(root_fd)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--single", action="store_true")
     parser.add_argument("--mode", type=lambda value: int(value, 8))
-    parser.add_argument("target", type=Path)
-    parser.add_argument("uid", type=int)
-    parser.add_argument("gid", type=int)
+    parser.add_argument("--root", type=Path)
+    parser.add_argument("--prepare-root", metavar="HERMES_HOME")
+    parser.add_argument("--safe-roots", metavar="HERMES_WRITE_SAFE_ROOT")
+    parser.add_argument("--runtime-uid", type=int)
+    parser.add_argument("--runtime-gid", type=int)
+    parser.add_argument("target", nargs="?", type=Path)
+    parser.add_argument("uid", nargs="?", type=int)
+    parser.add_argument("gid", nargs="?", type=int)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.prepare_root is not None:
+        if args.safe_roots is None or args.runtime_uid is None or args.runtime_gid is None:
+            parser.error(
+                "--prepare-root requires --safe-roots, --runtime-uid, and --runtime-gid"
+            )
+        if args.single or args.mode is not None or args.root is not None or any(
+            value is not None for value in (args.target, args.uid, args.gid)
+        ):
+            parser.error("--prepare-root cannot be combined with ownership repair")
+        prepare_root(
+            args.prepare_root,
+            args.safe_roots,
+            runtime_uid=args.runtime_uid,
+            runtime_gid=args.runtime_gid,
+        )
+        return 0
+    if any(value is not None for value in (args.safe_roots, args.runtime_uid, args.runtime_gid)):
+        parser.error("safe-root and runtime identity arguments require --prepare-root")
+    if args.root is None or args.target is None or args.uid is None or args.gid is None:
+        parser.error("ownership repair requires --root, target, uid, and gid")
     if args.uid < 0 or args.gid < 0:
         raise ValueError("UID and GID must be non-negative")
     if args.mode is not None and not args.single:
@@ -257,9 +424,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.mode is not None and not 0 <= args.mode <= 0o7777:
         raise ValueError("mode must be between 0000 and 7777")
     if args.single:
-        repair_path(args.target, args.uid, args.gid, mode=args.mode)
+        repair_path(args.target, args.uid, args.gid, root=args.root, mode=args.mode)
     else:
-        repair_tree(args.target, args.uid, args.gid)
+        repair_tree(args.target, args.uid, args.gid, root=args.root)
     return 0
 
 

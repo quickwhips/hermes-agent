@@ -17,7 +17,17 @@
 
 set -eu
 
+STAGE2_STATUS_MARKER=/run/hermes-stage2-status
+. /opt/hermes/docker/init_status.sh
+if ! BOOT_TOKEN=$(hermes_current_boot_token) || \
+        ! hermes_mark_status "$STAGE2_STATUS_MARKER" failed "$BOOT_TOKEN"; then
+    echo "[stage2] ERROR: cannot establish fail-closed startup marker" >&2
+    kill -TERM 1
+    exit 1
+fi
+
 HERMES_HOME="${HERMES_HOME:-/opt/data}"
+HERMES_WRITE_SAFE_ROOT="${HERMES_WRITE_SAFE_ROOT:-}"
 INSTALL_DIR="/opt/hermes"
 
 # Drop to hermes via s6-setuidgid, but skip it when already non-root.
@@ -72,18 +82,6 @@ volume accordingly, so files land owned by your host user — the same outcome
 EOF
     exit 1
 fi
-
-# --- Bootstrap HERMES_HOME as root ---
-# Create the directory (and any missing parents) while we still have root
-# privileges so the chown checks below see real metadata and the later
-# `s6-setuidgid hermes mkdir -p` block doesn't EACCES on root-owned
-# ancestors. Without this, custom HERMES_HOME paths whose parents only
-# root can create (e.g. `HERMES_HOME=/home/hermes/.hermes` in a Compose
-# file, or any path under a fresh / not pre-populated by the image)
-# fail on first boot with `mkdir: cannot create directory '/...': Permission
-# denied` and the cont-init hook exits non-zero. Idempotent — `mkdir -p`
-# is a no-op if the dir already exists. (#18482, salvages #18488)
-mkdir -p "$HERMES_HOME"
 
 # Numeric UID/GID validation: must be digits only, non-root, 1-65534.
 # NAS hosts such as Unraid commonly use low non-root IDs (99:100).
@@ -183,6 +181,19 @@ done
 actual_hermes_uid=$(id -u hermes)
 actual_hermes_gid=$(id -g hermes)
 
+# --- Bootstrap HERMES_HOME as root ---
+# Create missing components descriptor-relatively after UID/GID remapping so
+# the helper can prove that every non-mount path component has a parent the
+# eventual runtime identity cannot replace. Exact mount roots are stable by
+# kernel mount semantics. This keeps custom bind roots and root-owned
+# /home/hermes/.hermes while rejecting writable-parent paths such as /tmp.
+if ! "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/docker/chown_hermes_tree.py" \
+    --prepare-root "$HERMES_HOME" --safe-roots "$HERMES_WRITE_SAFE_ROOT" \
+    --runtime-uid "$actual_hermes_uid" --runtime-gid "$actual_hermes_gid"; then
+    echo "[stage2] ERROR: refusing unsafe HERMES_HOME ownership authority: $HERMES_HOME" >&2
+    exit 1
+fi
+
 path_has_symlink_component() {
     path="$1"
     root="${2:-$HERMES_HOME}"
@@ -227,7 +238,7 @@ chown_hermes_tree() {
     # filesystems and same-device bind mounts, and uses descriptor-relative
     # lstat/chown operations without following final symlinks.
     "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/docker/chown_hermes_tree.py" \
-        "$target" "$actual_hermes_uid" "$actual_hermes_gid" 2>/dev/null || \
+        --root "$HERMES_HOME" "$target" "$actual_hermes_uid" "$actual_hermes_gid" 2>/dev/null || \
         echo "[stage2] Warning: chown $target failed (rootless container?) — continuing"
 }
 
@@ -240,11 +251,11 @@ chown_hermes_path() {
     fi
     if [ -n "$mode" ]; then
         "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/docker/chown_hermes_tree.py" \
-            --single --mode "$mode" "$target" "$actual_hermes_uid" "$actual_hermes_gid" \
+            --single --mode "$mode" --root "$HERMES_HOME" "$target" "$actual_hermes_uid" "$actual_hermes_gid" \
             2>/dev/null || echo "[stage2] Warning: chown/chmod $target failed (rootless container?) — continuing"
     else
         "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/docker/chown_hermes_tree.py" \
-            --single "$target" "$actual_hermes_uid" "$actual_hermes_gid" 2>/dev/null || \
+            --single --root "$HERMES_HOME" "$target" "$actual_hermes_uid" "$actual_hermes_gid" 2>/dev/null || \
             echo "[stage2] Warning: chown $target failed (rootless container?) — continuing"
     fi
 }
@@ -594,3 +605,5 @@ if [ -z "${AGENT_BROWSER_EXECUTABLE_PATH:-}" ] && \
 fi
 
 echo "[stage2] Setup complete; starting user services"
+hermes_mark_status "$STAGE2_STATUS_MARKER" ready "$BOOT_TOKEN"
+exit 0

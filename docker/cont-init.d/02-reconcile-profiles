@@ -24,6 +24,16 @@
 # and swallows the failure).
 set -e
 
+STAGE2_STATUS_MARKER=/run/hermes-stage2-status
+SUPERVISE_STATUS_MARKER=/run/hermes-supervise-perms-status
+. /opt/hermes/docker/init_status.sh
+BOOT_TOKEN=$(hermes_current_boot_token)
+if ! hermes_status_is_ready "$STAGE2_STATUS_MARKER" "$BOOT_TOKEN" || \
+        ! hermes_status_is_ready "$SUPERVISE_STATUS_MARKER" "$BOOT_TOKEN"; then
+    echo "[reconcile] prerequisite init failed; refusing persistent-state reconciliation" >&2
+    exit 1
+fi
+
 # Make the dynamic scandir hermes-writable. The directory itself
 # starts root-owned by s6-overlay.
 chown hermes:hermes /run/service 2>/dev/null || true

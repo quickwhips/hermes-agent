@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import importlib.util
+import errno
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -37,6 +40,250 @@ def _mountinfo(path: Path, *mountpoints: Path) -> Path:
     ]
     path.write_text("".join(lines))
     return path
+
+
+@pytest.mark.parametrize(
+    ("value", "safe_roots"),
+    [
+        ("/", "/"),
+        ("/opt/data/..", "/opt"),
+        ("/opt/hermes", "/opt/hermes"),
+        ("/opt/hermes/runtime", "/opt/hermes/runtime"),
+        ("/etc/hermes", "/etc/hermes"),
+        ("/tmp/hermes", "/opt/data"),
+        ("relative/hermes", "relative/hermes"),
+        ("/opt/data", "/opt/data/.."),
+        ("//opt/data", "//opt/data"),
+        ("/tmp/hermes\nstate", "/tmp/hermes\nstate"),
+    ],
+)
+def test_root_policy_rejects_noncanonical_or_untrusted_authority(
+    value: str, safe_roots: str
+) -> None:
+    module = _load_helper()
+
+    with pytest.raises(ValueError, match="HERMES_HOME"):
+        module.validate_root_policy(value, safe_roots)
+
+
+@pytest.mark.parametrize(
+    ("value", "safe_roots"),
+    [
+        ("/opt/data", "/opt/data"),
+        ("/home/hermes/.hermes", "/home/hermes/.hermes"),
+        ("/config/hermes", "/workspace:/config/hermes"),
+        ("/tmp/hermes-test", "/tmp/hermes-test:/workspace"),
+    ],
+)
+def test_root_policy_accepts_explicit_canonical_safe_root(
+    value: str, safe_roots: str
+) -> None:
+    module = _load_helper()
+
+    assert module.validate_root_policy(value, safe_roots) == Path(value)
+
+
+def test_prepare_root_cli_fails_before_ownership_repair() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "--prepare-root",
+            "/opt/hermes",
+            "--safe-roots",
+            "/opt/hermes",
+            "--runtime-uid",
+            "99",
+            "--runtime-gid",
+            "100",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "HERMES_HOME" in result.stderr
+
+
+def test_prepare_root_rejects_symlink_without_writing_through_it(tmp_path: Path) -> None:
+    module = _load_helper()
+    external = tmp_path / "external"
+    external.mkdir()
+    configured = tmp_path / "configured"
+    configured.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        module.prepare_root(
+            str(configured),
+            str(configured),
+            runtime_uid=os.getuid() + 1,
+            runtime_gid=os.getgid() + 1,
+            mountinfo_path=_mountinfo(
+                tmp_path / "mountinfo", *reversed(configured.parents)
+            ),
+        )
+
+    assert list(external.iterdir()) == []
+
+
+def test_prepare_root_creates_missing_components_by_descriptor(tmp_path: Path) -> None:
+    module = _load_helper()
+    configured = tmp_path / "missing" / "hermes"
+
+    prepared = module.prepare_root(
+        str(configured),
+        str(configured),
+        runtime_uid=os.getuid() + 1,
+        runtime_gid=os.getgid() + 1,
+        mountinfo_path=_mountinfo(
+            tmp_path / "mountinfo", *reversed(configured.parents)
+        ),
+    )
+
+    assert prepared == configured
+    assert configured.is_dir()
+
+
+def test_prepare_root_rejects_runtime_writable_parent_before_creation(tmp_path: Path) -> None:
+    module = _load_helper()
+    configured = tmp_path / "replaceable"
+
+    with pytest.raises(OSError, match="runtime-writable parent"):
+        module.prepare_root(
+            str(configured),
+            str(configured),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            mountinfo_path=_mountinfo(tmp_path / "mountinfo", Path("/"), tmp_path),
+        )
+
+    assert not configured.exists()
+
+
+def test_parent_admission_rejects_runtime_owner_without_current_write_bits(
+    tmp_path: Path,
+) -> None:
+    module = _load_helper()
+    parent = tmp_path / "runtime-owned"
+    parent.mkdir(mode=0o555)
+    descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+
+    try:
+        with pytest.raises(OSError, match="runtime-writable parent"):
+            module._assert_stable_parent(
+                descriptor,
+                os.getuid(),
+                parent / "hermes",
+            )
+    finally:
+        os.close(descriptor)
+        parent.chmod(0o755)
+
+
+def test_prepare_root_allows_exact_mountpoint_with_writable_parent(tmp_path: Path) -> None:
+    module = _load_helper()
+    configured = tmp_path / "mounted"
+    configured.mkdir()
+
+    prepared = module.prepare_root(
+        str(configured),
+        str(configured),
+        runtime_uid=os.getuid(),
+        runtime_gid=os.getgid(),
+        mountinfo_path=_mountinfo(
+            tmp_path / "mountinfo", *reversed(configured.parents), configured
+        ),
+    )
+
+    assert prepared == configured
+
+
+def _parent_acl_probe(parent: Path, outcome: bytes | OSError):
+    def probe(descriptor: int, attribute: str) -> bytes:
+        assert attribute == "system.posix_acl_access"
+        opened = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        assert opened == parent
+        if isinstance(outcome, OSError):
+            raise outcome
+        return outcome
+
+    return probe
+
+
+def test_prepare_root_rejects_access_acl_on_nonmount_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    parent = tmp_path / "acl-parent"
+    parent.mkdir(mode=0o755)
+    configured = parent / "hermes"
+    monkeypatch.setattr(module.os, "getxattr", _parent_acl_probe(parent, b"extended-acl"))
+
+    with pytest.raises(OSError, match="access ACL"):
+        module.prepare_root(
+            str(configured),
+            str(configured),
+            runtime_uid=os.getuid() + 1,
+            runtime_gid=os.getgid() + 1,
+            mountinfo_path=_mountinfo(
+                tmp_path / "mountinfo", *reversed(configured.parents)
+            ),
+        )
+
+    assert not configured.exists()
+
+
+def test_prepare_root_rejects_unreadable_access_acl_on_nonmount_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    parent = tmp_path / "acl-parent"
+    parent.mkdir(mode=0o755)
+    configured = parent / "hermes"
+    monkeypatch.setattr(
+        module.os,
+        "getxattr",
+        _parent_acl_probe(parent, OSError(errno.EACCES, "ACL unreadable")),
+    )
+
+    with pytest.raises(OSError, match="ACL unreadable"):
+        module.prepare_root(
+            str(configured),
+            str(configured),
+            runtime_uid=os.getuid() + 1,
+            runtime_gid=os.getgid() + 1,
+            mountinfo_path=_mountinfo(
+                tmp_path / "mountinfo", *reversed(configured.parents)
+            ),
+        )
+
+    assert not configured.exists()
+
+
+def test_prepare_root_allows_nonmount_parent_without_access_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    parent = tmp_path / "plain-parent"
+    parent.mkdir(mode=0o755)
+    configured = parent / "hermes"
+    monkeypatch.setattr(
+        module.os,
+        "getxattr",
+        _parent_acl_probe(parent, OSError(errno.ENODATA, "no ACL")),
+    )
+
+    prepared = module.prepare_root(
+        str(configured),
+        str(configured),
+        runtime_uid=os.getuid() + 1,
+        runtime_gid=os.getgid() + 1,
+        mountinfo_path=_mountinfo(tmp_path / "mountinfo", *reversed(configured.parents)),
+    )
+
+    assert prepared == configured
+    assert configured.is_dir()
 
 
 def _record_chown(monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> list[tuple[object, int | None, bool]]:
@@ -181,6 +428,30 @@ def test_repair_tree_warm_tree_executes_no_chown(
     assert calls == []
 
 
+def test_repair_tree_uses_in_process_descriptor_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    target = tmp_path / "home"
+    target.mkdir()
+    (target / "state").write_text("repair")
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("ownership traversal must not spawn or shell out per entry")
+
+    monkeypatch.setattr(os, "system", forbidden)
+    monkeypatch.setattr(os, "fwalk", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+
+    module.repair_tree(
+        target,
+        os.getuid(),
+        os.getgid(),
+        mountinfo_path=_mountinfo(tmp_path / "mountinfo", target),
+    )
+
+
 def test_repair_tree_rejects_malformed_mountinfo_before_chown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -278,8 +549,8 @@ def test_repair_path_repairs_directory_and_regular_file_by_fd(
     state_file.write_text("state")
     calls = _record_chown(monkeypatch, module)
 
-    module.repair_path(directory, os.getuid() + 1, os.getgid() + 1)
-    module.repair_path(state_file, os.getuid() + 1, os.getgid() + 1)
+    module.repair_path(directory, os.getuid() + 1, os.getgid() + 1, root=tmp_path)
+    module.repair_path(state_file, os.getuid() + 1, os.getgid() + 1, root=tmp_path)
 
     assert len(calls) == 2
     assert {path for path, _fd, _follow in calls} == {"gateways", "state.db"}
@@ -300,9 +571,11 @@ def test_repair_path_rejects_intermediate_and_final_symlinks_before_chown(
     calls = _record_chown(monkeypatch, module)
 
     with pytest.raises(OSError):
-        module.repair_path(linked_parent / "state.db", os.getuid() + 1, os.getgid())
+        module.repair_path(
+            linked_parent / "state.db", os.getuid() + 1, os.getgid(), root=tmp_path
+        )
     with pytest.raises(OSError):
-        module.repair_path(linked_file, os.getuid() + 1, os.getgid())
+        module.repair_path(linked_file, os.getuid() + 1, os.getgid(), root=tmp_path)
 
     assert calls == []
 
@@ -321,7 +594,7 @@ def test_repair_path_applies_mode_through_open_descriptor(
         lambda descriptor, mode: modes.append((descriptor, mode)),
     )
 
-    module.repair_path(target, os.getuid(), os.getgid(), mode=0o640)
+    module.repair_path(target, os.getuid(), os.getgid(), root=tmp_path, mode=0o640)
 
     assert len(modes) == 1
     assert modes[0][0] >= 0
@@ -356,23 +629,6 @@ def test_mountinfo_field_grammar_fails_before_any_chown(
             mountinfo_path=mountinfo,
         )
     assert calls == []
-
-
-def test_helper_has_no_per_entry_process_spawn() -> None:
-    source = HELPER.read_text()
-
-    assert "subprocess" not in source
-    assert "mountpoint -q" not in source
-    assert "os.system" not in source
-    assert "os.fwalk" not in source
-    assert "_open_anchored_root" in source
-    assert "O_NOFOLLOW" in source
-    assert "os.listdir(directory_fd)" in source
-    assert "os.fchown" in source
-    assert "RESOLVE_NO_XDEV" in source
-    assert "RESOLVE_NO_SYMLINKS" in source
-    assert "RESOLVE_BENEATH" in source
-    assert "st_ino" not in source
 
 
 def test_open_beneath_rejects_symlink_redirection(
@@ -465,3 +721,114 @@ def test_repair_tree_contains_directory_swap_to_external_symlink(
     assert swapped is True
     assert calls == []
     assert (foreign / "foreign").read_text() == "foreign"
+
+
+def test_repair_path_allows_configured_root_mount_without_crossing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The configured home mount is an authority boundary, not a nested mount."""
+    module = _load_helper()
+    home = tmp_path / "home"
+    home.mkdir()
+    calls = _record_chown(monkeypatch, module)
+
+    module.repair_path(home, os.getuid() + 1, os.getgid() + 1, root=home)
+
+    assert [path for path, _fd, _follow in calls] == ["home"]
+
+
+def test_repair_path_refuses_nested_mount_target_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    home = tmp_path / "home"
+    nested = home / "foreign-file"
+    nested.parent.mkdir()
+    nested.write_text("do not touch")
+    calls = _record_chown(monkeypatch, module)
+    monkeypatch.setattr(
+        module,
+        "_open_beneath",
+        lambda _dir_fd, name, _flags: (_ for _ in ()).throw(
+            OSError(errno.EXDEV, "nested mount", name)
+        ),
+    )
+
+    with pytest.raises(OSError) as error:
+        module.repair_path(
+            nested,
+            os.getuid() + 1,
+            os.getgid() + 1,
+            root=home,
+        )
+
+    assert error.value.errno == errno.EXDEV
+    assert calls == []
+
+
+def test_repair_tree_refuses_a_nested_mount_as_its_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    home = tmp_path / "home"
+    nested = home / "foreign"
+    nested.mkdir(parents=True)
+    (nested / "foreign-state").write_text("do not touch")
+    calls = _record_chown(monkeypatch, module)
+
+    with pytest.raises(OSError):
+        module.repair_tree(
+            nested,
+            os.getuid() + 1,
+            os.getgid() + 1,
+            root=home,
+            mountinfo_path=_mountinfo(tmp_path / "mountinfo", home, nested),
+        )
+
+    assert calls == []
+
+
+def test_repair_rejects_target_outside_configured_root_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    home = tmp_path / "home"
+    outsider = tmp_path / "home-other"
+    home.mkdir()
+    outsider.mkdir()
+    calls = _record_chown(monkeypatch, module)
+
+    with pytest.raises(ValueError, match="configured root"):
+        module.repair_path(outsider, os.getuid() + 1, os.getgid() + 1, root=home)
+
+    assert calls == []
+
+
+def test_repair_path_closes_root_and_target_descriptors_after_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    home = tmp_path / "home"
+    target = home / "state"
+    home.mkdir()
+    target.write_text("state")
+    original_open = module._open_beneath
+    original_close = module.os.close
+    opened: list[int] = []
+    closed: list[int] = []
+
+    def tracking_open(dir_fd: int, name: str, flags: int) -> int:
+        descriptor = original_open(dir_fd, name, flags)
+        opened.append(descriptor)
+        return descriptor
+
+    def tracking_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(module, "_open_beneath", tracking_open)
+    monkeypatch.setattr(module.os, "close", tracking_close)
+
+    module.repair_path(target, os.getuid(), os.getgid(), root=home)
+
+    assert set(opened) <= set(closed)
