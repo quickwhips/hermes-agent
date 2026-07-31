@@ -92,6 +92,10 @@ def test_prepare_root_cli_fails_before_ownership_repair() -> None:
             "/opt/hermes",
             "--safe-roots",
             "/opt/hermes",
+            "--runtime-uid",
+            "99",
+            "--runtime-gid",
+            "100",
         ],
         capture_output=True,
         text=True,
@@ -110,7 +114,15 @@ def test_prepare_root_rejects_symlink_without_writing_through_it(tmp_path: Path)
     configured.symlink_to(external, target_is_directory=True)
 
     with pytest.raises(OSError):
-        module.prepare_root(str(configured), str(configured))
+        module.prepare_root(
+            str(configured),
+            str(configured),
+            runtime_uid=os.getuid() + 1,
+            runtime_gid=os.getgid() + 1,
+            mountinfo_path=_mountinfo(
+                tmp_path / "mountinfo", *reversed(configured.parents)
+            ),
+        )
 
     assert list(external.iterdir()) == []
 
@@ -119,10 +131,52 @@ def test_prepare_root_creates_missing_components_by_descriptor(tmp_path: Path) -
     module = _load_helper()
     configured = tmp_path / "missing" / "hermes"
 
-    prepared = module.prepare_root(str(configured), str(configured))
+    prepared = module.prepare_root(
+        str(configured),
+        str(configured),
+        runtime_uid=os.getuid() + 1,
+        runtime_gid=os.getgid() + 1,
+        mountinfo_path=_mountinfo(
+            tmp_path / "mountinfo", *reversed(configured.parents)
+        ),
+    )
 
     assert prepared == configured
     assert configured.is_dir()
+
+
+def test_prepare_root_rejects_runtime_writable_parent_before_creation(tmp_path: Path) -> None:
+    module = _load_helper()
+    configured = tmp_path / "replaceable"
+
+    with pytest.raises(OSError, match="runtime-writable parent"):
+        module.prepare_root(
+            str(configured),
+            str(configured),
+            runtime_uid=os.getuid(),
+            runtime_gid=os.getgid(),
+            mountinfo_path=_mountinfo(tmp_path / "mountinfo", Path("/"), tmp_path),
+        )
+
+    assert not configured.exists()
+
+
+def test_prepare_root_allows_exact_mountpoint_with_writable_parent(tmp_path: Path) -> None:
+    module = _load_helper()
+    configured = tmp_path / "mounted"
+    configured.mkdir()
+
+    prepared = module.prepare_root(
+        str(configured),
+        str(configured),
+        runtime_uid=os.getuid(),
+        runtime_gid=os.getgid(),
+        mountinfo_path=_mountinfo(
+            tmp_path / "mountinfo", *reversed(configured.parents), configured
+        ),
+    )
+
+    assert prepared == configured
 
 
 def _record_chown(monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> list[tuple[object, int | None, bool]]:

@@ -190,12 +190,41 @@ def validate_root_policy(value: str, safe_roots: str) -> Path:
     return root
 
 
-def prepare_root(value: str, safe_roots: str) -> Path:
-    """Create/open the configured root without following any path symlink."""
+def _runtime_can_replace_child(metadata: os.stat_result, runtime_uid: int) -> bool:
+    mode = metadata.st_mode
+    return bool(
+        (metadata.st_uid == runtime_uid and mode & stat.S_IWUSR)
+        or mode & stat.S_IWGRP
+        or mode & stat.S_IWOTH
+    )
+
+
+def prepare_root(
+    value: str,
+    safe_roots: str,
+    *,
+    runtime_uid: int,
+    runtime_gid: int,
+    mountinfo_path: Path = Path("/proc/self/mountinfo"),
+) -> Path:
+    """Create/open a root whose pathname the runtime identity cannot replace."""
+    if runtime_uid < 1 or runtime_gid < 1:
+        raise ValueError("runtime UID and GID must be positive")
     root = validate_root_policy(value, safe_roots)
+    mountpoints = _mountpoints(mountinfo_path)
     descriptor = os.open("/", _DIRECTORY_FLAGS)
+    current = Path("/")
     try:
         for component in root.parts[1:]:
+            child = current / component
+            if str(child) not in mountpoints and _runtime_can_replace_child(
+                os.fstat(descriptor), runtime_uid
+            ):
+                raise OSError(
+                    errno.EPERM,
+                    "HERMES_HOME has a runtime-writable parent",
+                    str(child),
+                )
             try:
                 next_descriptor = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
             except FileNotFoundError:
@@ -206,6 +235,7 @@ def prepare_root(value: str, safe_roots: str) -> Path:
                 next_descriptor = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
+            current = child
     finally:
         os.close(descriptor)
     return root
@@ -331,6 +361,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", type=Path)
     parser.add_argument("--prepare-root", metavar="HERMES_HOME")
     parser.add_argument("--safe-roots", metavar="HERMES_WRITE_SAFE_ROOT")
+    parser.add_argument("--runtime-uid", type=int)
+    parser.add_argument("--runtime-gid", type=int)
     parser.add_argument("target", nargs="?", type=Path)
     parser.add_argument("uid", nargs="?", type=int)
     parser.add_argument("gid", nargs="?", type=int)
@@ -341,16 +373,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     if args.prepare_root is not None:
-        if args.safe_roots is None:
-            parser.error("--prepare-root requires --safe-roots")
+        if args.safe_roots is None or args.runtime_uid is None or args.runtime_gid is None:
+            parser.error(
+                "--prepare-root requires --safe-roots, --runtime-uid, and --runtime-gid"
+            )
         if args.single or args.mode is not None or args.root is not None or any(
             value is not None for value in (args.target, args.uid, args.gid)
         ):
             parser.error("--prepare-root cannot be combined with ownership repair")
-        prepare_root(args.prepare_root, args.safe_roots)
+        prepare_root(
+            args.prepare_root,
+            args.safe_roots,
+            runtime_uid=args.runtime_uid,
+            runtime_gid=args.runtime_gid,
+        )
         return 0
-    if args.safe_roots is not None:
-        parser.error("--safe-roots requires --prepare-root")
+    if any(value is not None for value in (args.safe_roots, args.runtime_uid, args.runtime_gid)):
+        parser.error("safe-root and runtime identity arguments require --prepare-root")
     if args.root is None or args.target is None or args.uid is None or args.gid is None:
         parser.error("ownership repair requires --root, target, uid, and gid")
     if args.uid < 0 or args.gid < 0:

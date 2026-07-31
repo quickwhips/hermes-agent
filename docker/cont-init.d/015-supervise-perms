@@ -38,6 +38,11 @@
 
 set -eu
 
+if [ -e /run/hermes-stage2-failed ]; then
+    echo "[supervise-perms] stage2 failed; refusing follow-on initialization" >&2
+    exit 1
+fi
+
 # /run/s6-rc/servicedirs holds the live, compiled service directories
 # for every static (s6-rc) service. Symlinks under /run/service/*
 # point here. Per-service supervise/ + event/ both need hermes

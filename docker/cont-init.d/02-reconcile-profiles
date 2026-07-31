@@ -24,6 +24,11 @@
 # and swallows the failure).
 set -e
 
+if [ -e /run/hermes-stage2-failed ]; then
+    echo "[reconcile] stage2 failed; refusing persistent-state reconciliation" >&2
+    exit 1
+fi
+
 # Make the dynamic scandir hermes-writable. The directory itself
 # starts root-owned by s6-overlay.
 chown hermes:hermes /run/service 2>/dev/null || true

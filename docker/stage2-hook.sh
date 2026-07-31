@@ -17,6 +17,10 @@
 
 set -eu
 
+STAGE2_FAILURE_MARKER=/run/hermes-stage2-failed
+rm -f "$STAGE2_FAILURE_MARKER"
+trap 'status=$?; if [ "$status" -ne 0 ]; then : > "$STAGE2_FAILURE_MARKER"; fi' EXIT
+
 HERMES_HOME="${HERMES_HOME:-/opt/data}"
 HERMES_WRITE_SAFE_ROOT="${HERMES_WRITE_SAFE_ROOT:-}"
 INSTALL_DIR="/opt/hermes"
@@ -71,22 +75,6 @@ The image remaps the hermes user to that UID/GID at boot and chowns the data
 volume accordingly, so files land owned by your host user — the same outcome
 --user was being used for, without breaking the supervision tree.
 EOF
-    exit 1
-fi
-
-# --- Bootstrap HERMES_HOME as root ---
-# Create the directory (and any missing parents) while we still have root
-# privileges so the chown checks below see real metadata and the later
-# `s6-setuidgid hermes mkdir -p` block doesn't EACCES on root-owned
-# ancestors. Without this, the supported custom
-# `HERMES_HOME=/home/hermes/.hermes` path can fail on first boot when its
-# root-owned parent has not yet been populated by the image, with
-# `mkdir: cannot create directory '/...': Permission denied`. The helper uses
-# descriptor-relative mkdir/open operations so an existing or raced symlink
-# cannot redirect root bootstrap writes. (#18482, salvages #18488)
-if ! "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/docker/chown_hermes_tree.py" \
-    --prepare-root "$HERMES_HOME" --safe-roots "$HERMES_WRITE_SAFE_ROOT"; then
-    echo "[stage2] ERROR: refusing unsafe HERMES_HOME ownership authority: $HERMES_HOME" >&2
     exit 1
 fi
 
@@ -187,6 +175,19 @@ done
 # mkdir -p block below seeds. Keep them in sync if the seed list changes.
 actual_hermes_uid=$(id -u hermes)
 actual_hermes_gid=$(id -g hermes)
+
+# --- Bootstrap HERMES_HOME as root ---
+# Create missing components descriptor-relatively after UID/GID remapping so
+# the helper can prove that every non-mount path component has a parent the
+# eventual runtime identity cannot replace. Exact mount roots are stable by
+# kernel mount semantics. This keeps custom bind roots and root-owned
+# /home/hermes/.hermes while rejecting writable-parent paths such as /tmp.
+if ! "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/docker/chown_hermes_tree.py" \
+    --prepare-root "$HERMES_HOME" --safe-roots "$HERMES_WRITE_SAFE_ROOT" \
+    --runtime-uid "$actual_hermes_uid" --runtime-gid "$actual_hermes_gid"; then
+    echo "[stage2] ERROR: refusing unsafe HERMES_HOME ownership authority: $HERMES_HOME" >&2
+    exit 1
+fi
 
 path_has_symlink_component() {
     path="$1"
