@@ -32,6 +32,12 @@ def _managed_tree_needs_chown_function(text: str) -> str:
     return match.group(1)
 
 
+def _chown_hermes_path_function(text: str) -> str:
+    match = re.search(r"(chown_hermes_path\(\) \{.*?\n\})", text, re.DOTALL)
+    assert match is not None, "chown_hermes_path helper missing"
+    return match.group(1)
+
+
 def _run_helper(
     text: str,
     target: Path,
@@ -43,6 +49,7 @@ def _run_helper(
     shell = shutil.which("sh")
     if shell is None:
         pytest.skip("sh not available")
+    assert shell is not None
     hermes_home = target if hermes_home is None else hermes_home
     install_dir = log_path.parent / "install"
     python = install_dir / ".venv" / "bin" / "python"
@@ -75,9 +82,46 @@ def test_chown_helper_repairs_real_directories(stage2_text: str, tmp_path: Path)
 
     assert proc.returncode == 0, proc.stderr
     assert log_path.read_text().splitlines() == [
-        f"{tmp_path}/install/docker/chown_hermes_tree.py {target} 99 100",
+        f"{tmp_path}/install/docker/chown_hermes_tree.py --root {target} {target} 99 100",
     ]
     assert "mountpoint" not in log_path.read_text()
+
+
+def test_single_path_helper_passes_configured_home_as_trusted_root(
+    stage2_text: str, tmp_path: Path
+) -> None:
+    shell = shutil.which("sh")
+    if shell is None:
+        pytest.skip("sh not available")
+    assert shell is not None
+    home = tmp_path / "home"
+    target = home / "state.db"
+    home.mkdir()
+    target.write_text("state")
+    install_dir = tmp_path / "install"
+    log_path = tmp_path / "chown.log"
+    python = install_dir / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log_path}"\n')
+    python.chmod(0o755)
+    (install_dir / "docker").mkdir()
+    (install_dir / "docker" / "chown_hermes_tree.py").touch()
+    script = (
+        "set -eu\n"
+        f'HERMES_HOME="{home}"\n'
+        f'INSTALL_DIR="{install_dir}"\n'
+        "actual_hermes_uid=99\n"
+        "actual_hermes_gid=100\n"
+        f"{_chown_hermes_path_function(stage2_text)}\n"
+        f'chown_hermes_path "{target}" 640\n'
+    )
+
+    proc = subprocess.run([shell, "-c", script], capture_output=True, text=True)
+
+    assert proc.returncode == 0, proc.stderr
+    assert log_path.read_text().splitlines() == [
+        f"{install_dir}/docker/chown_hermes_tree.py --single --mode 640 --root {home} {target} 99 100",
+    ]
 
 
 def test_chown_helper_is_fail_soft_when_python_helper_fails(
@@ -100,6 +144,7 @@ def test_gid_only_drift_activates_managed_tree_repair(
     shell = shutil.which("sh")
     if shell is None:
         pytest.skip("sh not available")
+    assert shell is not None
     target = tmp_path / "home"
     target.mkdir()
     script = (

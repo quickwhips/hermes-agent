@@ -143,32 +143,52 @@ def _open_anchored_root(target: str) -> int:
     return descriptor
 
 
-def _open_anchored_parent(target: str) -> tuple[int, str]:
-    parts = Path(target).parts
-    if len(parts) < 2:
-        raise ValueError("ownership path must name an entry below root")
-    descriptor = os.open("/", _DIRECTORY_FLAGS)
-    try:
-        for component in parts[1:-1]:
-            next_descriptor = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
-            os.close(descriptor)
-            descriptor = next_descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
-    return descriptor, parts[-1]
-
-
-def repair_path(target: Path, uid: int, gid: int, *, mode: int | None = None) -> None:
-    """Repair one directory or regular file through an anchored descriptor."""
+def _relative_to_root(target: Path, root: Path) -> tuple[str, str]:
+    """Return absolute lexical paths after rejecting targets outside ``root``."""
+    root_text = os.path.abspath(os.fspath(root))
     target_text = os.path.abspath(os.fspath(target))
-    parent_fd, name = _open_anchored_parent(target_text)
+    relative = os.path.relpath(target_text, root_text)
+    if relative == os.pardir or relative.startswith(f"{os.pardir}{os.sep}"):
+        raise ValueError("ownership target is outside configured root")
+    return root_text, relative
+
+
+def _open_target(root_fd: int, relative: str) -> int:
+    """Resolve a target only beneath the already-authorized root descriptor."""
+    if relative == os.curdir:
+        return os.dup(root_fd)
+    descriptor = root_fd
+    opened: int | None = None
+    try:
+        components = Path(relative).parts
+        for component in components[:-1]:
+            opened = _open_beneath(descriptor, component, _DIRECTORY_FLAGS)
+            os.close(descriptor) if descriptor != root_fd else None
+            descriptor = opened
+            opened = None
+        opened = _open_beneath(descriptor, components[-1], _FILE_FLAGS)
+        return opened
+    except BaseException:
+        if opened is not None:
+            os.close(opened)
+        raise
+    finally:
+        if descriptor != root_fd:
+            os.close(descriptor)
+
+
+def repair_path(
+    target: Path, uid: int, gid: int, *, root: Path | None = None, mode: int | None = None
+) -> None:
+    """Repair one directory or regular file beneath the trusted root descriptor."""
+    root_text, relative = _relative_to_root(target, target if root is None else root)
+    root_fd = _open_anchored_root(root_text)
     descriptor: int | None = None
     try:
-        descriptor = _open_beneath(parent_fd, name, _FILE_FLAGS)
+        descriptor = _open_target(root_fd, relative)
         opened = os.fstat(descriptor)
         if not stat.S_ISDIR(opened.st_mode) and not stat.S_ISREG(opened.st_mode):
-            raise OSError(f"ownership target changed type during resolution: {target_text}")
+            raise OSError(f"ownership target changed type during resolution: {target}")
         if opened.st_uid != uid or opened.st_gid != gid:
             os.fchown(descriptor, uid, gid)
         if mode is not None:
@@ -176,7 +196,7 @@ def repair_path(target: Path, uid: int, gid: int, *, mode: int | None = None) ->
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        os.close(parent_fd)
+        os.close(root_fd)
 
 
 def repair_tree(
@@ -184,14 +204,21 @@ def repair_tree(
     uid: int,
     gid: int,
     *,
+    root: Path | None = None,
     mountinfo_path: Path = Path("/proc/self/mountinfo"),
 ) -> None:
-    """Repair mismatched entries through anchored directory descriptors."""
-    target_text = os.path.abspath(os.fspath(target))
+    """Repair mismatched entries beneath the trusted root descriptor."""
+    root_text, relative = _relative_to_root(target, target if root is None else root)
     nested_mounts = _mountpoints(mountinfo_path)
-    root_descriptor = _open_anchored_root(target_text)
-    open_descriptors = {root_descriptor}
+    target_text = os.path.abspath(os.fspath(target))
+    if target_text != root_text and target_text in nested_mounts:
+        raise OSError(errno.EXDEV, "ownership target is a nested mount", target_text)
+    root_fd = _open_anchored_root(root_text)
+    root_descriptor: int | None = None
+    open_descriptors: set[int] = set()
     try:
+        root_descriptor = _open_target(root_fd, relative)
+        open_descriptors.add(root_descriptor)
         root_stat = os.fstat(root_descriptor)
         root_device = root_stat.st_dev
         if root_stat.st_uid != uid or root_stat.st_gid != gid:
@@ -236,12 +263,14 @@ def repair_tree(
     finally:
         for descriptor in open_descriptors:
             os.close(descriptor)
+        os.close(root_fd)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--single", action="store_true")
     parser.add_argument("--mode", type=lambda value: int(value, 8))
+    parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("target", type=Path)
     parser.add_argument("uid", type=int)
     parser.add_argument("gid", type=int)
@@ -257,9 +286,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.mode is not None and not 0 <= args.mode <= 0o7777:
         raise ValueError("mode must be between 0000 and 7777")
     if args.single:
-        repair_path(args.target, args.uid, args.gid, mode=args.mode)
+        repair_path(args.target, args.uid, args.gid, root=args.root, mode=args.mode)
     else:
-        repair_tree(args.target, args.uid, args.gid)
+        repair_tree(args.target, args.uid, args.gid, root=args.root)
     return 0
 
 

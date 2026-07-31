@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import errno
 import os
 from pathlib import Path
 from types import ModuleType
@@ -278,8 +279,8 @@ def test_repair_path_repairs_directory_and_regular_file_by_fd(
     state_file.write_text("state")
     calls = _record_chown(monkeypatch, module)
 
-    module.repair_path(directory, os.getuid() + 1, os.getgid() + 1)
-    module.repair_path(state_file, os.getuid() + 1, os.getgid() + 1)
+    module.repair_path(directory, os.getuid() + 1, os.getgid() + 1, root=tmp_path)
+    module.repair_path(state_file, os.getuid() + 1, os.getgid() + 1, root=tmp_path)
 
     assert len(calls) == 2
     assert {path for path, _fd, _follow in calls} == {"gateways", "state.db"}
@@ -300,9 +301,11 @@ def test_repair_path_rejects_intermediate_and_final_symlinks_before_chown(
     calls = _record_chown(monkeypatch, module)
 
     with pytest.raises(OSError):
-        module.repair_path(linked_parent / "state.db", os.getuid() + 1, os.getgid())
+        module.repair_path(
+            linked_parent / "state.db", os.getuid() + 1, os.getgid(), root=tmp_path
+        )
     with pytest.raises(OSError):
-        module.repair_path(linked_file, os.getuid() + 1, os.getgid())
+        module.repair_path(linked_file, os.getuid() + 1, os.getgid(), root=tmp_path)
 
     assert calls == []
 
@@ -321,7 +324,7 @@ def test_repair_path_applies_mode_through_open_descriptor(
         lambda descriptor, mode: modes.append((descriptor, mode)),
     )
 
-    module.repair_path(target, os.getuid(), os.getgid(), mode=0o640)
+    module.repair_path(target, os.getuid(), os.getgid(), root=tmp_path, mode=0o640)
 
     assert len(modes) == 1
     assert modes[0][0] >= 0
@@ -465,3 +468,114 @@ def test_repair_tree_contains_directory_swap_to_external_symlink(
     assert swapped is True
     assert calls == []
     assert (foreign / "foreign").read_text() == "foreign"
+
+
+def test_repair_path_allows_configured_root_mount_without_crossing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The configured home mount is an authority boundary, not a nested mount."""
+    module = _load_helper()
+    home = tmp_path / "home"
+    home.mkdir()
+    calls = _record_chown(monkeypatch, module)
+
+    module.repair_path(home, os.getuid() + 1, os.getgid() + 1, root=home)
+
+    assert [path for path, _fd, _follow in calls] == ["home"]
+
+
+def test_repair_path_refuses_nested_mount_target_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    home = tmp_path / "home"
+    nested = home / "foreign-file"
+    nested.parent.mkdir()
+    nested.write_text("do not touch")
+    calls = _record_chown(monkeypatch, module)
+    monkeypatch.setattr(
+        module,
+        "_open_beneath",
+        lambda _dir_fd, name, _flags: (_ for _ in ()).throw(
+            OSError(errno.EXDEV, "nested mount", name)
+        ),
+    )
+
+    with pytest.raises(OSError) as error:
+        module.repair_path(
+            nested,
+            os.getuid() + 1,
+            os.getgid() + 1,
+            root=home,
+        )
+
+    assert error.value.errno == errno.EXDEV
+    assert calls == []
+
+
+def test_repair_tree_refuses_a_nested_mount_as_its_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    home = tmp_path / "home"
+    nested = home / "foreign"
+    nested.mkdir(parents=True)
+    (nested / "foreign-state").write_text("do not touch")
+    calls = _record_chown(monkeypatch, module)
+
+    with pytest.raises(OSError):
+        module.repair_tree(
+            nested,
+            os.getuid() + 1,
+            os.getgid() + 1,
+            root=home,
+            mountinfo_path=_mountinfo(tmp_path / "mountinfo", home, nested),
+        )
+
+    assert calls == []
+
+
+def test_repair_rejects_target_outside_configured_root_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    home = tmp_path / "home"
+    outsider = tmp_path / "home-other"
+    home.mkdir()
+    outsider.mkdir()
+    calls = _record_chown(monkeypatch, module)
+
+    with pytest.raises(ValueError, match="configured root"):
+        module.repair_path(outsider, os.getuid() + 1, os.getgid() + 1, root=home)
+
+    assert calls == []
+
+
+def test_repair_path_closes_root_and_target_descriptors_after_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    home = tmp_path / "home"
+    target = home / "state"
+    home.mkdir()
+    target.write_text("state")
+    original_open = module._open_beneath
+    original_close = module.os.close
+    opened: list[int] = []
+    closed: list[int] = []
+
+    def tracking_open(dir_fd: int, name: str, flags: int) -> int:
+        descriptor = original_open(dir_fd, name, flags)
+        opened.append(descriptor)
+        return descriptor
+
+    def tracking_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(module, "_open_beneath", tracking_open)
+    monkeypatch.setattr(module.os, "close", tracking_close)
+
+    module.repair_path(target, os.getuid(), os.getgid(), root=home)
+
+    assert set(opened) <= set(closed)

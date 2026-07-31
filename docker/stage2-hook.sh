@@ -227,7 +227,7 @@ chown_hermes_tree() {
     # filesystems and same-device bind mounts, and uses descriptor-relative
     # lstat/chown operations without following final symlinks.
     "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/docker/chown_hermes_tree.py" \
-        "$target" "$actual_hermes_uid" "$actual_hermes_gid" 2>/dev/null || \
+        --root "$HERMES_HOME" "$target" "$actual_hermes_uid" "$actual_hermes_gid" 2>/dev/null || \
         echo "[stage2] Warning: chown $target failed (rootless container?) — continuing"
 }
 
@@ -240,11 +240,11 @@ chown_hermes_path() {
     fi
     if [ -n "$mode" ]; then
         "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/docker/chown_hermes_tree.py" \
-            --single --mode "$mode" "$target" "$actual_hermes_uid" "$actual_hermes_gid" \
+            --single --mode "$mode" --root "$HERMES_HOME" "$target" "$actual_hermes_uid" "$actual_hermes_gid" \
             2>/dev/null || echo "[stage2] Warning: chown/chmod $target failed (rootless container?) — continuing"
     else
         "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/docker/chown_hermes_tree.py" \
-            --single "$target" "$actual_hermes_uid" "$actual_hermes_gid" 2>/dev/null || \
+            --single --root "$HERMES_HOME" "$target" "$actual_hermes_uid" "$actual_hermes_gid" 2>/dev/null || \
             echo "[stage2] Warning: chown $target failed (rootless container?) — continuing"
     fi
 }
