@@ -199,6 +199,37 @@ def _runtime_can_replace_child(metadata: os.stat_result, runtime_uid: int) -> bo
     )
 
 
+def _has_access_acl(descriptor: int) -> bool:
+    """Return whether an opened directory carries a POSIX access ACL."""
+    try:
+        os.getxattr(descriptor, "system.posix_acl_access")
+    except OSError as exc:
+        no_acl_errnos = {
+            errno.ENODATA,
+            errno.ENOTSUP,
+            errno.EOPNOTSUPP,
+        }
+        if exc.errno in no_acl_errnos:
+            return False
+        raise
+    return True
+
+
+def _assert_stable_parent(descriptor: int, runtime_uid: int, child: Path) -> None:
+    if _has_access_acl(descriptor):
+        raise OSError(
+            errno.EPERM,
+            "HERMES_HOME has a parent with a POSIX access ACL",
+            str(child),
+        )
+    if _runtime_can_replace_child(os.fstat(descriptor), runtime_uid):
+        raise OSError(
+            errno.EPERM,
+            "HERMES_HOME has a runtime-writable parent",
+            str(child),
+        )
+
+
 def prepare_root(
     value: str,
     safe_roots: str,
@@ -217,14 +248,8 @@ def prepare_root(
     try:
         for component in root.parts[1:]:
             child = current / component
-            if str(child) not in mountpoints and _runtime_can_replace_child(
-                os.fstat(descriptor), runtime_uid
-            ):
-                raise OSError(
-                    errno.EPERM,
-                    "HERMES_HOME has a runtime-writable parent",
-                    str(child),
-                )
+            if str(child) not in mountpoints:
+                _assert_stable_parent(descriptor, runtime_uid, child)
             try:
                 next_descriptor = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
             except FileNotFoundError:

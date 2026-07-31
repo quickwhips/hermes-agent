@@ -179,6 +179,93 @@ def test_prepare_root_allows_exact_mountpoint_with_writable_parent(tmp_path: Pat
     assert prepared == configured
 
 
+def _parent_acl_probe(parent: Path, outcome: bytes | OSError):
+    def probe(descriptor: int, attribute: str) -> bytes:
+        assert attribute == "system.posix_acl_access"
+        opened = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        assert opened == parent
+        if isinstance(outcome, OSError):
+            raise outcome
+        return outcome
+
+    return probe
+
+
+def test_prepare_root_rejects_access_acl_on_nonmount_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    parent = tmp_path / "acl-parent"
+    parent.mkdir(mode=0o755)
+    configured = parent / "hermes"
+    monkeypatch.setattr(module.os, "getxattr", _parent_acl_probe(parent, b"extended-acl"))
+
+    with pytest.raises(OSError, match="access ACL"):
+        module.prepare_root(
+            str(configured),
+            str(configured),
+            runtime_uid=os.getuid() + 1,
+            runtime_gid=os.getgid() + 1,
+            mountinfo_path=_mountinfo(
+                tmp_path / "mountinfo", *reversed(configured.parents)
+            ),
+        )
+
+    assert not configured.exists()
+
+
+def test_prepare_root_rejects_unreadable_access_acl_on_nonmount_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    parent = tmp_path / "acl-parent"
+    parent.mkdir(mode=0o755)
+    configured = parent / "hermes"
+    monkeypatch.setattr(
+        module.os,
+        "getxattr",
+        _parent_acl_probe(parent, OSError(errno.EACCES, "ACL unreadable")),
+    )
+
+    with pytest.raises(OSError, match="ACL unreadable"):
+        module.prepare_root(
+            str(configured),
+            str(configured),
+            runtime_uid=os.getuid() + 1,
+            runtime_gid=os.getgid() + 1,
+            mountinfo_path=_mountinfo(
+                tmp_path / "mountinfo", *reversed(configured.parents)
+            ),
+        )
+
+    assert not configured.exists()
+
+
+def test_prepare_root_allows_nonmount_parent_without_access_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    parent = tmp_path / "plain-parent"
+    parent.mkdir(mode=0o755)
+    configured = parent / "hermes"
+    monkeypatch.setattr(
+        module.os,
+        "getxattr",
+        _parent_acl_probe(parent, OSError(errno.ENODATA, "no ACL")),
+    )
+
+    prepared = module.prepare_root(
+        str(configured),
+        str(configured),
+        runtime_uid=os.getuid() + 1,
+        runtime_gid=os.getgid() + 1,
+        mountinfo_path=_mountinfo(tmp_path / "mountinfo", *reversed(configured.parents)),
+    )
+
+    assert prepared == configured
+    assert configured.is_dir()
+
+
 def _record_chown(monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> list[tuple[object, int | None, bool]]:
     calls: list[tuple[object, int | None, bool]] = []
 
