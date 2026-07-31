@@ -1578,6 +1578,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_cjk_loaded = False
         self._fts_cjk_available = False
         self._fts_unavailable_warned = False
+        # Read-only handles deliberately do not reconcile old databases.  Keep
+        # their actual columns so browse/search can project missing modern
+        # fields as harmless defaults instead of issuing migration-shaped SQL.
+        self._schema_columns: Dict[str, set[str]] = {}
+        self._legacy_read_compat = False
         self._conn = None
         # Async token accounting (see queue_token_counts). The condition
         # guards queue + writer state; it is distinct from self._lock so
@@ -1617,6 +1622,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "SELECT 1 FROM sqlite_master "
                     "WHERE type = 'table' AND name = 'messages_fts_trigram'"
                 ).fetchone())
+                self._schema_columns = {
+                    name: {r["name"] for r in self._conn.execute(f"PRAGMA table_info({name})")}
+                    for name in ("sessions", "messages")
+                }
+                self._legacy_read_compat = (
+                    "session_key" not in self._schema_columns.get("sessions", set())
+                    or "archived" not in self._schema_columns.get("sessions", set())
+                    or "active" not in self._schema_columns.get("messages", set())
+                )
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1728,6 +1742,48 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise
 
     # ── Read-path split ──
+
+    def _has_column(self, table: str, column: str) -> bool:
+        """Whether a column exists on this handle's observed schema.
+
+        Schema discovery happens once during a read-only open.  Writable
+        SessionDB instances always run reconciliation and retain the established
+        current-schema path.
+        """
+        return not self.read_only or column in self._schema_columns.get(table, set())
+
+    def _legacy_read_sessions(self, *, source=None, sources=None, exclude_sources=None,
+                              limit=20, offset=0, include_archived=False,
+                              archived_only=False, **_ignored):
+        """Bounded old-schema list projection; never assumes optional fields."""
+        where, params = [], []
+        if source or sources:
+            values = [source] if source else list(sources or [])
+            if self._has_column("sessions", "source"):
+                where.append(f"COALESCE(s.source, 'cli') IN ({','.join('?' for _ in values)})")
+                params.extend(values)
+        if exclude_sources and self._has_column("sessions", "source"):
+            where.append(f"COALESCE(s.source, 'cli') NOT IN ({','.join('?' for _ in exclude_sources)})")
+            params.extend(exclude_sources)
+        if self._has_column("sessions", "archived"):
+            if archived_only:
+                where.append("s.archived = 1")
+            elif not include_archived:
+                where.append("COALESCE(s.archived, 0) = 0")
+        last_active = "COALESCE((SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id=s.id), s.started_at)"
+        sql = f"SELECT s.*, {last_active} AS last_active FROM sessions s"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY last_active DESC, s.id DESC LIMIT ? OFFSET ?"
+        with self._read_ctx() as conn:
+            rows = [dict(r) for r in conn.execute(sql, [*params, limit, offset]).fetchall()]
+        for row in rows:
+            row.setdefault("archived", 0)
+            row.setdefault("pinned", 0)
+            row.setdefault("message_count", 0)
+            row.setdefault("tool_call_count", 0)
+            row["preview"] = ""
+        return rows
 
     def _get_read_conn(self) -> Optional[sqlite3.Connection]:
         """Per-thread read-only connection, or None when unavailable.
@@ -4754,6 +4810,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         obey the same filters (source, archived, min_message_count) as the
         page: an archived or filtered-out conversation stays out.
         """
+        if self._legacy_read_compat:
+            return self._legacy_read_sessions(
+                source=source, sources=sources, exclude_sources=exclude_sources,
+                limit=limit, offset=offset, include_archived=include_archived,
+                archived_only=archived_only,
+            )
         # Rows carry token/cost totals — drain queued deltas first so
         # listings (sidebar, /resume, dashboards) show exact counters.
         self.flush_token_counts()
@@ -5611,7 +5673,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``offset`` alone (without ``limit``) also pages — SQLite requires a
         LIMIT clause for OFFSET, so it's emitted as ``LIMIT -1`` (unbounded).
         """
-        active_clause = "" if include_inactive else " AND active = 1"
+        active_clause = (
+            "" if include_inactive or not self._has_column("messages", "active")
+            else " AND active = 1"
+        )
         sql = (
             "SELECT * FROM messages WHERE session_id = ?"
             f"{active_clause} ORDER BY id"
@@ -6327,6 +6392,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cron-excluded ``list_sessions_rich`` page and doesn't keep "load more"
         stuck on for buried scheduler sessions).
         """
+        if self._legacy_read_compat:
+            return len(self._legacy_read_sessions(
+                source=source, sources=sources, exclude_sources=exclude_sources,
+                limit=1_000_000, include_archived=include_archived,
+                archived_only=archived_only,
+            ))
         where_clauses = []
         params = []
 

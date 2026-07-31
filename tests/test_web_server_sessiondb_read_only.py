@@ -23,6 +23,45 @@ def _seed_session(db_path, session_id: str = "session-read") -> None:
         db.close()
 
 
+def _seed_legacy_session(db_path) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, model TEXT, title TEXT, started_at REAL, ended_at REAL);
+            CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, timestamp REAL);
+            INSERT INTO sessions VALUES ('legacy-session', 'cron', 'legacy-model', 'Legacy title', 1000, NULL);
+            INSERT INTO messages VALUES (1, 'legacy-session', 'user', 'legacy needle transcript', 1001);
+        """)
+
+
+def test_read_only_legacy_schema_serves_dashboard_reads_without_schema_writes(tmp_path, monkeypatch):
+    import hermes_state
+
+    db_path = tmp_path / "state.db"
+    _seed_legacy_session(db_path)
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+    before = db_path.read_bytes()
+    db = SessionDB(db_path=db_path, read_only=True)
+    statements: list[str] = []
+    db._conn.set_trace_callback(statements.append)
+    try:
+        assert db.list_sessions_rich(include_archived=True)[0]["id"] == "legacy-session"
+        assert db.get_messages("legacy-session")[0]["content"] == "legacy needle transcript"
+        assert db.search_messages("needle")[0]["session_id"] == "legacy-session"
+        assert db.export_session("legacy-session")["messages"][0]["id"] == 1
+    finally:
+        db.close()
+    assert db_path.read_bytes() == before
+    assert not any(token in sql.lower() for sql in statements for token in ("create ", "alter ", "insert ", "update ", "delete "))
+    assert web_server.get_sessions()["sessions"][0]["id"] == "legacy-session"
+    assert asyncio.run(web_server.get_session_detail("legacy-session"))["title"] == "Legacy title"
+    assert asyncio.run(web_server.get_session_messages("legacy-session"))["messages"][0]["id"] == 1
+    assert asyncio.run(web_server.search_sessions(q="needle"))["results"][0]["id"] == "legacy-session"
+    assert asyncio.run(web_server.export_session_endpoint("legacy-session"))["messages"][0]["id"] == 1
+    assert asyncio.run(web_server.get_session_stats())["total"] == 1
+    assert web_server._get_usage_analytics(days=7)["daily"] == []
+    assert web_server._get_models_analytics(days=7)["models"] == []
+
+
 def test_search_read_runs_off_event_loop_and_closes(monkeypatch):
     loop_thread = threading.get_ident()
     db_threads: list[int] = []
