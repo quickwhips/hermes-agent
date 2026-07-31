@@ -374,6 +374,9 @@ ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
 ENV HERMES_HOME=/opt/data
 ENV HERMES_WRITE_SAFE_ROOT=/opt/data
+# Bootstrap validation and ownership repair are security boundaries.  Make a
+# non-zero cont-init hook stop service startup instead of continuing to CMD.
+ENV S6_BEHAVIOUR_IF_STAGE2_FAILS=2
 ENV HERMES_DISABLE_LAZY_INSTALLS=1
 # The published image seals /opt/hermes (root-owned, read-only) so a runtime
 # lazy install can't mutate the agent's own venv and brick it. But opt-in

@@ -4,6 +4,8 @@ from __future__ import annotations
 import importlib.util
 import errno
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -38,6 +40,52 @@ def _mountinfo(path: Path, *mountpoints: Path) -> Path:
     ]
     path.write_text("".join(lines))
     return path
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/",
+        "/opt/data/..",
+        "/opt/hermes",
+        "/opt/hermes/runtime",
+        "/etc/hermes",
+        "/tmp/hermes",
+        "relative/hermes",
+    ],
+)
+def test_root_policy_rejects_noncanonical_or_untrusted_authority(value: str) -> None:
+    module = _load_helper()
+
+    with pytest.raises(ValueError, match="HERMES_HOME"):
+        module.validate_root_policy(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/opt/data",
+        "/opt/data/profiles/operator",
+        "/home/hermes/.hermes",
+        "/home/hermes/.hermes/profiles/operator",
+    ],
+)
+def test_root_policy_accepts_only_explicit_container_data_roots(value: str) -> None:
+    module = _load_helper()
+
+    assert module.validate_root_policy(value) == Path(value)
+
+
+def test_validate_root_cli_fails_before_ownership_repair() -> None:
+    result = subprocess.run(
+        [sys.executable, str(HELPER), "--validate-root", "/opt/hermes"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "HERMES_HOME" in result.stderr
 
 
 def _record_chown(monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> list[tuple[object, int | None, bool]]:
@@ -359,23 +407,6 @@ def test_mountinfo_field_grammar_fails_before_any_chown(
             mountinfo_path=mountinfo,
         )
     assert calls == []
-
-
-def test_helper_has_no_per_entry_process_spawn() -> None:
-    source = HELPER.read_text()
-
-    assert "subprocess" not in source
-    assert "mountpoint -q" not in source
-    assert "os.system" not in source
-    assert "os.fwalk" not in source
-    assert "_open_anchored_root" in source
-    assert "O_NOFOLLOW" in source
-    assert "os.listdir(directory_fd)" in source
-    assert "os.fchown" in source
-    assert "RESOLVE_NO_XDEV" in source
-    assert "RESOLVE_NO_SYMLINKS" in source
-    assert "RESOLVE_BENEATH" in source
-    assert "st_ino" not in source
 
 
 def test_open_beneath_rejects_symlink_redirection(

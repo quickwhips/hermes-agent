@@ -5,6 +5,7 @@ import argparse
 import ctypes
 import errno
 import os
+import posixpath
 import re
 import stat
 from collections.abc import Sequence
@@ -33,6 +34,7 @@ _SYS_OPENAT2 = 437
 _RESOLVE_NO_XDEV = 0x01
 _RESOLVE_NO_SYMLINKS = 0x04
 _RESOLVE_BENEATH = 0x08
+_ALLOWED_DATA_ROOTS = (Path("/opt/data"), Path("/home/hermes/.hermes"))
 
 
 class _OpenHow(ctypes.Structure):
@@ -153,6 +155,16 @@ def _relative_to_root(target: Path, root: Path) -> tuple[str, str]:
     return root_text, relative
 
 
+def validate_root_policy(value: str) -> Path:
+    """Validate stage2's root-owned mutation authority before any writes."""
+    if not value.startswith("/") or posixpath.normpath(value) != value:
+        raise ValueError("HERMES_HOME must be an absolute canonical data-root path")
+    root = Path(value)
+    if not any(root == allowed or root.is_relative_to(allowed) for allowed in _ALLOWED_DATA_ROOTS):
+        raise ValueError("HERMES_HOME is outside the supported container data roots")
+    return root
+
+
 def _open_target(root_fd: int, relative: str) -> int:
     """Resolve a target only beneath the already-authorized root descriptor."""
     if relative == os.curdir:
@@ -270,15 +282,26 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--single", action="store_true")
     parser.add_argument("--mode", type=lambda value: int(value, 8))
-    parser.add_argument("--root", required=True, type=Path)
-    parser.add_argument("target", type=Path)
-    parser.add_argument("uid", type=int)
-    parser.add_argument("gid", type=int)
+    parser.add_argument("--root", type=Path)
+    parser.add_argument("--validate-root", metavar="HERMES_HOME")
+    parser.add_argument("target", nargs="?", type=Path)
+    parser.add_argument("uid", nargs="?", type=int)
+    parser.add_argument("gid", nargs="?", type=int)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.validate_root is not None:
+        if args.single or args.mode is not None or args.root is not None or any(
+            value is not None for value in (args.target, args.uid, args.gid)
+        ):
+            parser.error("--validate-root cannot be combined with ownership repair")
+        validate_root_policy(args.validate_root)
+        return 0
+    if args.root is None or args.target is None or args.uid is None or args.gid is None:
+        parser.error("ownership repair requires --root, target, uid, and gid")
     if args.uid < 0 or args.gid < 0:
         raise ValueError("UID and GID must be non-negative")
     if args.mode is not None and not args.single:
