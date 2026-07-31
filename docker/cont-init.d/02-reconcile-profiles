@@ -24,8 +24,11 @@
 # and swallows the failure).
 set -e
 
-if [ -e /run/hermes-stage2-failed ]; then
-    echo "[reconcile] stage2 failed; refusing persistent-state reconciliation" >&2
+STAGE2_STATUS_MARKER=/run/hermes-stage2-status
+SUPERVISE_STATUS_MARKER=/run/hermes-supervise-perms-status
+if [ "$(cat "$STAGE2_STATUS_MARKER" 2>/dev/null || true)" != ready ] || \
+        [ "$(cat "$SUPERVISE_STATUS_MARKER" 2>/dev/null || true)" != ready ]; then
+    echo "[reconcile] prerequisite init failed; refusing persistent-state reconciliation" >&2
     exit 1
 fi
 

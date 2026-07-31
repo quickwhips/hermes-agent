@@ -38,10 +38,25 @@
 
 set -eu
 
-if [ -e /run/hermes-stage2-failed ]; then
+STAGE2_STATUS_MARKER=/run/hermes-stage2-status
+SUPERVISE_STATUS_MARKER=/run/hermes-supervise-perms-status
+
+if ! printf 'failed\n' > "$SUPERVISE_STATUS_MARKER"; then
+    echo "[supervise-perms] cannot establish fail-closed status marker" >&2
+    exit 1
+fi
+
+if [ "$(cat "$STAGE2_STATUS_MARKER" 2>/dev/null || true)" != ready ]; then
     echo "[supervise-perms] stage2 failed; refusing follow-on initialization" >&2
     exit 1
 fi
+
+mark_supervise_ready() {
+    ready_tmp="${SUPERVISE_STATUS_MARKER}.ready.$$"
+    printf 'ready\n' > "$ready_tmp"
+    chmod 0600 "$ready_tmp"
+    mv -f "$ready_tmp" "$SUPERVISE_STATUS_MARKER"
+}
 
 # /run/s6-rc/servicedirs holds the live, compiled service directories
 # for every static (s6-rc) service. Symlinks under /run/service/*
@@ -51,6 +66,7 @@ SVC_ROOT=/run/s6-rc/servicedirs
 
 if [ ! -d "$SVC_ROOT" ]; then
     echo "[supervise-perms] $SVC_ROOT not present; skipping"
+    mark_supervise_ready
     exit 0
 fi
 
@@ -93,3 +109,5 @@ for svc in "$SVC_ROOT"/*; do
 done
 
 echo "[supervise-perms] chowned supervise/ trees for static s6-rc services"
+mark_supervise_ready
+exit 0

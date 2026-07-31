@@ -17,8 +17,8 @@
 
 set -eu
 
-STAGE2_FAILURE_MARKER=/run/hermes-stage2-failed
-if ! : > "$STAGE2_FAILURE_MARKER"; then
+STAGE2_STATUS_MARKER=/run/hermes-stage2-status
+if ! printf 'failed\n' > "$STAGE2_STATUS_MARKER"; then
     echo "[stage2] ERROR: cannot establish fail-closed startup marker" >&2
     kill -TERM 1
     exit 1
@@ -603,5 +603,8 @@ if [ -z "${AGENT_BROWSER_EXECUTABLE_PATH:-}" ] && \
 fi
 
 echo "[stage2] Setup complete; starting user services"
-rm -f "$STAGE2_FAILURE_MARKER"
+stage2_ready_tmp="${STAGE2_STATUS_MARKER}.ready.$$"
+printf 'ready\n' > "$stage2_ready_tmp"
+chmod 0600 "$stage2_ready_tmp"
+mv -f "$stage2_ready_tmp" "$STAGE2_STATUS_MARKER"
 exit 0
