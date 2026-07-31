@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import re
 import stat
@@ -24,9 +25,16 @@ def _run_shell(script: str, *args: Path) -> subprocess.CompletedProcess[str]:
 
 
 def test_current_boot_token_identifies_pid_namespace_and_pid1_start() -> None:
+    try:
+        os.readlink("/proc/1/ns/pid")
+        Path("/proc/1/stat").read_text()
+    except OSError as exc:
+        if exc.errno in {errno.ENOENT, errno.EACCES, errno.EPERM}:
+            pytest.skip("host does not expose the current PID namespace identity")
+        raise
+
     result = _run_shell(f'. "{STATUS_HELPER}"; hermes_current_boot_token')
-    if result.returncode != 0:
-        pytest.skip("host does not expose the current PID namespace identity")
+    assert result.returncode == 0, result.stderr
     assert re.fullmatch(r"pid:\[\d+\]:\d+", result.stdout)
 
 
