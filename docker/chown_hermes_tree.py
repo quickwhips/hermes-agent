@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import os
 import re
 import stat
-from collections.abc import Iterable
+from collections.abc import Sequence
 from pathlib import Path
 
 _MOUNT_ESCAPE = re.compile(r"\\(040|011|012|134)")
@@ -27,6 +29,45 @@ _FILE_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_NONBLOCK", 0)
 )
+_SYS_OPENAT2 = 437
+_RESOLVE_NO_XDEV = 0x01
+_RESOLVE_NO_SYMLINKS = 0x04
+_RESOLVE_BENEATH = 0x08
+
+
+class _OpenHow(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint64),
+        ("mode", ctypes.c_uint64),
+        ("resolve", ctypes.c_uint64),
+    ]
+
+
+def _open_beneath(dir_fd: int, name: str, flags: int) -> int:
+    """Open the current child without following links or crossing mounts."""
+    if not name or name in {".", ".."} or "/" in name:
+        raise ValueError("ownership entry must be one path component")
+    libc = ctypes.CDLL(None, use_errno=True)
+    syscall = getattr(libc, "syscall", None)
+    if syscall is None:
+        raise OSError(errno.ENOSYS, "openat2 is unavailable", name)
+    syscall.restype = ctypes.c_long
+    how = _OpenHow(
+        flags=flags,
+        mode=0,
+        resolve=_RESOLVE_BENEATH | _RESOLVE_NO_SYMLINKS | _RESOLVE_NO_XDEV,
+    )
+    result = syscall(
+        ctypes.c_long(_SYS_OPENAT2),
+        ctypes.c_int(dir_fd),
+        ctypes.c_char_p(os.fsencode(name)),
+        ctypes.byref(how),
+        ctypes.c_size_t(ctypes.sizeof(how)),
+    )
+    if result < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), name)
+    return int(result)
 
 
 def _decode_mount_path(value: str) -> str:
@@ -89,27 +130,6 @@ def _mountpoints(path: Path) -> frozenset[str]:
     return frozenset(points)
 
 
-def _open_matching_entry(
-    name: str,
-    entry_stat: os.stat_result,
-    *,
-    dir_fd: int,
-    flags: int,
-) -> tuple[int, os.stat_result]:
-    descriptor = os.open(name, flags, dir_fd=dir_fd)
-    try:
-        opened_stat = os.fstat(descriptor)
-        if (entry_stat.st_dev, entry_stat.st_ino) != (
-            opened_stat.st_dev,
-            opened_stat.st_ino,
-        ):
-            raise OSError(f"ownership target changed during traversal: {name}")
-        return descriptor, opened_stat
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-
 def _open_anchored_root(target: str) -> int:
     descriptor = os.open("/", _DIRECTORY_FLAGS)
     try:
@@ -145,18 +165,11 @@ def repair_path(target: Path, uid: int, gid: int, *, mode: int | None = None) ->
     parent_fd, name = _open_anchored_parent(target_text)
     descriptor: int | None = None
     try:
-        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(before.st_mode) and not stat.S_ISREG(before.st_mode):
-            raise OSError(
-                f"ownership target is not a directory or regular file: {target_text}"
-            )
-        descriptor = os.open(name, _FILE_FLAGS, dir_fd=parent_fd)
-        after = os.fstat(descriptor)
-        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-            raise OSError(f"ownership target changed during resolution: {target_text}")
-        if not stat.S_ISDIR(after.st_mode) and not stat.S_ISREG(after.st_mode):
+        descriptor = _open_beneath(parent_fd, name, _FILE_FLAGS)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode) and not stat.S_ISREG(opened.st_mode):
             raise OSError(f"ownership target changed type during resolution: {target_text}")
-        if after.st_uid != uid or after.st_gid != gid:
+        if opened.st_uid != uid or opened.st_gid != gid:
             os.fchown(descriptor, uid, gid)
         if mode is not None:
             os.fchmod(descriptor, mode)
@@ -190,52 +203,33 @@ def repair_tree(
             try:
                 for name in os.listdir(directory_fd):
                     full_path = os.path.join(directory, name)
+                    if full_path in nested_mounts:
+                        continue
+                    entry_fd: int | None = None
                     try:
-                        entry_stat = os.stat(
-                            name, dir_fd=directory_fd, follow_symlinks=False
-                        )
-                    except FileNotFoundError:
-                        continue
-                    if full_path in nested_mounts or entry_stat.st_dev != root_device:
-                        continue
-                    if not stat.S_ISDIR(entry_stat.st_mode):
-                        if not stat.S_ISREG(entry_stat.st_mode):
-                            continue
                         try:
-                            leaf_fd, leaf_stat = _open_matching_entry(
-                                name,
-                                entry_stat,
-                                dir_fd=directory_fd,
-                                flags=_FILE_FLAGS,
-                            )
-                        except FileNotFoundError:
-                            continue
-                        try:
-                            if leaf_stat.st_dev != root_device:
+                            entry_fd = _open_beneath(directory_fd, name, _FILE_FLAGS)
+                        except OSError as error:
+                            if error.errno in {errno.ENOENT, errno.ELOOP, errno.EXDEV}:
                                 continue
-                            if leaf_stat.st_uid != uid or leaf_stat.st_gid != gid:
-                                os.fchown(leaf_fd, uid, gid)
-                        finally:
-                            os.close(leaf_fd)
-                        continue
-
-                    try:
-                        child_fd, child_stat = _open_matching_entry(
-                            name,
-                            entry_stat,
-                            dir_fd=directory_fd,
-                            flags=_DIRECTORY_FLAGS,
-                        )
-                    except FileNotFoundError:
-                        continue
-                    open_descriptors.add(child_fd)
-                    if child_stat.st_dev != root_device:
-                        os.close(child_fd)
-                        open_descriptors.remove(child_fd)
-                        continue
-                    if child_stat.st_uid != uid or child_stat.st_gid != gid:
-                        os.fchown(child_fd, uid, gid)
-                    pending.append((child_fd, full_path))
+                            raise
+                        entry_stat = os.fstat(entry_fd)
+                        if entry_stat.st_dev != root_device:
+                            continue
+                        if stat.S_ISDIR(entry_stat.st_mode):
+                            open_descriptors.add(entry_fd)
+                            if entry_stat.st_uid != uid or entry_stat.st_gid != gid:
+                                os.fchown(entry_fd, uid, gid)
+                            pending.append((entry_fd, full_path))
+                            entry_fd = None
+                            continue
+                        if stat.S_ISREG(entry_stat.st_mode) and (
+                            entry_stat.st_uid != uid or entry_stat.st_gid != gid
+                        ):
+                            os.fchown(entry_fd, uid, gid)
+                    finally:
+                        if entry_fd is not None:
+                            os.close(entry_fd)
             finally:
                 os.close(directory_fd)
                 open_descriptors.remove(directory_fd)
@@ -254,7 +248,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Iterable[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.uid < 0 or args.gid < 0:
         raise ValueError("UID and GID must be non-negative")

@@ -369,30 +369,31 @@ def test_helper_has_no_per_entry_process_spawn() -> None:
     assert "O_NOFOLLOW" in source
     assert "os.listdir(directory_fd)" in source
     assert "os.fchown" in source
-    assert "dir_fd=directory_fd" in source
-    assert "follow_symlinks=False" in source
+    assert "RESOLVE_NO_XDEV" in source
+    assert "RESOLVE_NO_SYMLINKS" in source
+    assert "RESOLVE_BENEATH" in source
+    assert "st_ino" not in source
 
 
-def _drifting_stat(
-    module: ModuleType,
-    monkeypatch: pytest.MonkeyPatch,
-    entry_name: str,
+def test_open_beneath_rejects_symlink_redirection(
+    tmp_path: Path,
 ) -> None:
-    original_stat = module.os.stat
+    module = _load_helper()
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    foreign = tmp_path / "foreign"
+    foreign.write_text("foreign")
+    (managed / "redirect").symlink_to(foreign)
+    parent_fd = os.open(managed, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
 
-    def fake_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
-        result = original_stat(path, *args, **kwargs)
-        if path == entry_name and kwargs.get("dir_fd") is not None:
-            values = list(result)
-            values[4] = os.getuid() + 1
-            values[5] = os.getgid() + 1
-            return os.stat_result(values)
-        return result
-
-    monkeypatch.setattr(module.os, "stat", fake_stat)
+    try:
+        with pytest.raises(OSError):
+            module._open_beneath(parent_fd, "redirect", module._FILE_FLAGS)
+    finally:
+        os.close(parent_fd)
 
 
-def test_repair_tree_rejects_regular_file_inode_swap_before_chown(
+def test_repair_tree_contains_regular_file_swap_to_external_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _load_helper()
@@ -400,34 +401,35 @@ def test_repair_tree_rejects_regular_file_inode_swap_before_chown(
     target.mkdir()
     leaf = target / "state"
     leaf.write_text("original")
-    _drifting_stat(module, monkeypatch, "state")
-    original_open = module.os.open
+    foreign = tmp_path / "foreign"
+    foreign.write_text("foreign")
+    original_open = module._open_beneath
     swapped = False
 
-    def swapping_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+    def swapping_open(dir_fd: int, name: str, flags: int) -> int:
         nonlocal swapped
-        if path == "state" and kwargs.get("dir_fd") is not None and not swapped:
+        if name == "state" and not swapped:
             swapped = True
             leaf.unlink()
-            leaf.write_text("replacement")
-        return original_open(path, flags, *args, **kwargs)
+            leaf.symlink_to(foreign)
+        return original_open(dir_fd, name, flags)
 
-    monkeypatch.setattr(module.os, "open", swapping_open)
+    monkeypatch.setattr(module, "_open_beneath", swapping_open)
     calls = _record_chown(monkeypatch, module)
 
-    with pytest.raises(OSError, match="changed during traversal"):
-        module.repair_tree(
-            target,
-            os.getuid(),
-            os.getgid(),
-            mountinfo_path=_mountinfo(tmp_path / "mountinfo", target),
-        )
+    module.repair_tree(
+        target,
+        os.getuid(),
+        os.getgid(),
+        mountinfo_path=_mountinfo(tmp_path / "mountinfo", target),
+    )
 
     assert swapped is True
     assert calls == []
+    assert foreign.read_text() == "foreign"
 
 
-def test_repair_tree_rejects_directory_inode_swap_before_chown_or_traversal(
+def test_repair_tree_contains_directory_swap_to_external_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _load_helper()
@@ -436,29 +438,30 @@ def test_repair_tree_rejects_directory_inode_swap_before_chown_or_traversal(
     child.mkdir(parents=True)
     (child / "original").write_text("original")
     stale = target / "stale-child"
-    _drifting_stat(module, monkeypatch, "child")
-    original_open = module.os.open
+    foreign = tmp_path / "foreign-directory"
+    foreign.mkdir()
+    (foreign / "foreign").write_text("foreign")
+    original_open = module._open_beneath
     swapped = False
 
-    def swapping_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+    def swapping_open(dir_fd: int, name: str, flags: int) -> int:
         nonlocal swapped
-        if path == "child" and kwargs.get("dir_fd") is not None and not swapped:
+        if name == "child" and not swapped:
             swapped = True
             child.rename(stale)
-            child.mkdir()
-            (child / "replacement").write_text("replacement")
-        return original_open(path, flags, *args, **kwargs)
+            child.symlink_to(foreign, target_is_directory=True)
+        return original_open(dir_fd, name, flags)
 
-    monkeypatch.setattr(module.os, "open", swapping_open)
+    monkeypatch.setattr(module, "_open_beneath", swapping_open)
     calls = _record_chown(monkeypatch, module)
 
-    with pytest.raises(OSError, match="changed during traversal"):
-        module.repair_tree(
-            target,
-            os.getuid(),
-            os.getgid(),
-            mountinfo_path=_mountinfo(tmp_path / "mountinfo", target),
-        )
+    module.repair_tree(
+        target,
+        os.getuid(),
+        os.getgid(),
+        mountinfo_path=_mountinfo(tmp_path / "mountinfo", target),
+    )
 
     assert swapped is True
     assert calls == []
+    assert (foreign / "foreign").read_text() == "foreign"
