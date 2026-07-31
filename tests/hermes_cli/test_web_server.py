@@ -10282,7 +10282,7 @@ class TestDashboardComponentHealth:
         data = resp.json()
         assert data["overall"] in {"ok", "degraded"}
         components = data["components"]
-        assert set(components) == {"gateway", "storage", "dashboard", "platforms"}
+        assert set(components) == {"gateway", "storage", "dashboard", "platforms", "pty"}
         for comp in components.values():
             assert comp["status"] in {"ok", "degraded"}
         dashboard = components["dashboard"]

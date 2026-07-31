@@ -47,6 +47,7 @@ def pty_client(monkeypatch, _isolate_hermes_home):
     monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
     monkeypatch.setattr(ws.PtyBridge, "spawn", _OneFrameBridge.spawn)
     ws.app.state.pty_active_session_files = {}
+    ws.PTY_REGISTRY._sessions.clear()
 
     client = TestClient(ws.app)
     return ws, client, ws._SESSION_TOKEN
@@ -129,6 +130,69 @@ def test_fresh_param_ignores_channel_active_session_file(pty_client, monkeypatch
     assert captured["resume"] is None
     assert captured["active_session_file"] == str(active_file)
     assert not active_file.exists()
+
+
+def test_fresh_param_rotates_keepalive_attach_identity(pty_client, monkeypatch):
+    """Explicit fresh on an attach token retires the old PTY identity."""
+    ws, client, token = pty_client
+    bridges = []
+
+    class _IdleBridge(_OneFrameBridge):
+        def read(self, timeout):
+            return b""
+
+        @classmethod
+        def spawn(cls, *args, **kwargs):
+            bridge = cls()
+            bridges.append(bridge)
+            return bridge
+
+    monkeypatch.setattr(ws.PtyBridge, "spawn", _IdleBridge.spawn)
+    monkeypatch.setattr(
+        ws, "_resolve_chat_argv", lambda **kw: (["fake-hermes-tui"], None, None)
+    )
+
+    with client.websocket_connect(_url(token, attach="sentinel-attach-secret")) as conn:
+        conn.send_bytes(b"first")
+
+    with client.websocket_connect(
+        _url(token, attach="sentinel-attach-secret", fresh="1")
+    ) as conn:
+        conn.send_bytes(b"second")
+
+    assert len(bridges) == 2
+    assert bridges[0].closed is True
+    assert bridges[1].closed is False
+    snapshot = ws.PTY_REGISTRY.snapshot()
+    assert snapshot["sessions"]["total"] == 1
+    assert snapshot["events"]["forced_fresh"] == 1
+    assert "sentinel-attach-secret" not in repr(snapshot)
+
+
+def test_status_exposes_secret_safe_pty_component(pty_client, monkeypatch):
+    ws, client, token = pty_client
+
+    class _IdleBridge(_OneFrameBridge):
+        def read(self, timeout):
+            return b""
+
+    monkeypatch.setattr(ws.PtyBridge, "spawn", _IdleBridge.spawn)
+    monkeypatch.setattr(
+        ws, "_resolve_chat_argv", lambda **kw: (["fake-hermes-tui"], None, None)
+    )
+
+    with client.websocket_connect(
+        _url(token, attach="sentinel-status-secret", channel="status-chan")
+    ) as conn:
+        conn.send_bytes(b"hi")
+
+    payload = client.get(f"/api/status?token={token}").json()
+    pty = payload["components"]["pty"]
+
+    assert pty["status"] == "ok"
+    assert pty["sessions"]["total"] == 1
+    assert pty["events"]["create"] >= 1
+    assert "sentinel-status-secret" not in repr(pty)
 
 
 def test_child_eof_closes_socket_and_bridge(pty_client, monkeypatch):
