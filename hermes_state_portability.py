@@ -92,6 +92,11 @@ class SessionPortabilityMixin:
         Returns the same enriched row shape as ``list_sessions_rich`` (adds
         ``preview`` + ``last_active``) so callers can reuse it.
         """
+        if self._legacy_read_compat:
+            prefix = f"cron_{job_id}_"
+            return [row for row in self._legacy_read_sessions(
+                source="cron", limit=limit, offset=offset, include_archived=True
+            ) if str(row.get("id") or "").startswith(prefix)]
         prefix = f"cron_{job_id}_"
         # Half-open upper bound for an index range scan: increment the final
         # byte of the prefix so the range covers exactly the ids that start
@@ -136,6 +141,11 @@ class SessionPortabilityMixin:
         Pass ``compact_rows=True`` to omit the ``system_prompt`` blob (see
         ``list_sessions_rich`` for details).
         """
+        if self._legacy_read_compat:
+            for row in self._legacy_read_sessions(limit=1_000_000, include_archived=True):
+                if row.get("id") == session_id:
+                    return row
+            return None
         # Same read-your-writes guarantee as list_sessions_rich.
         self.flush_token_counts()
         _sel = self._compact_session_cols() if compact_rows else "s.*"
