@@ -161,7 +161,12 @@ def _relative_to_root(target: Path, root: Path) -> tuple[str, str]:
 
 def validate_root_policy(value: str, safe_roots: str) -> Path:
     """Validate stage2's root-owned mutation authority before any writes."""
-    if not value.startswith("/") or posixpath.normpath(value) != value:
+    if (
+        not value.startswith("/")
+        or value.startswith("//")
+        or posixpath.normpath(value) != value
+        or any(not character.isprintable() for character in value)
+    ):
         raise ValueError("HERMES_HOME must be an absolute canonical data-root path")
     root = Path(value)
     if root == Path("/") or root.is_relative_to(_INSTALL_ROOT) or _INSTALL_ROOT.is_relative_to(root):
@@ -172,11 +177,37 @@ def validate_root_policy(value: str, safe_roots: str) -> Path:
     for entry in safe_roots.split(os.pathsep):
         if not entry:
             continue
-        if not entry.startswith("/") or posixpath.normpath(entry) != entry:
+        if (
+            not entry.startswith("/")
+            or entry.startswith("//")
+            or posixpath.normpath(entry) != entry
+            or any(not character.isprintable() for character in entry)
+        ):
             raise ValueError("HERMES_HOME requires canonical HERMES_WRITE_SAFE_ROOT entries")
         accepted.add(Path(entry))
     if root not in accepted:
         raise ValueError("HERMES_HOME must exactly match a HERMES_WRITE_SAFE_ROOT entry")
+    return root
+
+
+def prepare_root(value: str, safe_roots: str) -> Path:
+    """Create/open the configured root without following any path symlink."""
+    root = validate_root_policy(value, safe_roots)
+    descriptor = os.open("/", _DIRECTORY_FLAGS)
+    try:
+        for component in root.parts[1:]:
+            try:
+                next_descriptor = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o755, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                next_descriptor = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+    finally:
+        os.close(descriptor)
     return root
 
 
@@ -298,7 +329,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--single", action="store_true")
     parser.add_argument("--mode", type=lambda value: int(value, 8))
     parser.add_argument("--root", type=Path)
-    parser.add_argument("--validate-root", metavar="HERMES_HOME")
+    parser.add_argument("--prepare-root", metavar="HERMES_HOME")
     parser.add_argument("--safe-roots", metavar="HERMES_WRITE_SAFE_ROOT")
     parser.add_argument("target", nargs="?", type=Path)
     parser.add_argument("uid", nargs="?", type=int)
@@ -309,17 +340,17 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.validate_root is not None:
+    if args.prepare_root is not None:
         if args.safe_roots is None:
-            parser.error("--validate-root requires --safe-roots")
+            parser.error("--prepare-root requires --safe-roots")
         if args.single or args.mode is not None or args.root is not None or any(
             value is not None for value in (args.target, args.uid, args.gid)
         ):
-            parser.error("--validate-root cannot be combined with ownership repair")
-        validate_root_policy(args.validate_root, args.safe_roots)
+            parser.error("--prepare-root cannot be combined with ownership repair")
+        prepare_root(args.prepare_root, args.safe_roots)
         return 0
     if args.safe_roots is not None:
-        parser.error("--safe-roots requires --validate-root")
+        parser.error("--safe-roots requires --prepare-root")
     if args.root is None or args.target is None or args.uid is None or args.gid is None:
         parser.error("ownership repair requires --root, target, uid, and gid")
     if args.uid < 0 or args.gid < 0:

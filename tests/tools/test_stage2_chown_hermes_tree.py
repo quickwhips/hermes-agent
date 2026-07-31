@@ -53,6 +53,8 @@ def _mountinfo(path: Path, *mountpoints: Path) -> Path:
         ("/tmp/hermes", "/opt/data"),
         ("relative/hermes", "relative/hermes"),
         ("/opt/data", "/opt/data/.."),
+        ("//opt/data", "//opt/data"),
+        ("/tmp/hermes\nstate", "/tmp/hermes\nstate"),
     ],
 )
 def test_root_policy_rejects_noncanonical_or_untrusted_authority(
@@ -81,12 +83,12 @@ def test_root_policy_accepts_explicit_canonical_safe_root(
     assert module.validate_root_policy(value, safe_roots) == Path(value)
 
 
-def test_validate_root_cli_fails_before_ownership_repair() -> None:
+def test_prepare_root_cli_fails_before_ownership_repair() -> None:
     result = subprocess.run(
         [
             sys.executable,
             str(HELPER),
-            "--validate-root",
+            "--prepare-root",
             "/opt/hermes",
             "--safe-roots",
             "/opt/hermes",
@@ -98,6 +100,29 @@ def test_validate_root_cli_fails_before_ownership_repair() -> None:
 
     assert result.returncode != 0
     assert "HERMES_HOME" in result.stderr
+
+
+def test_prepare_root_rejects_symlink_without_writing_through_it(tmp_path: Path) -> None:
+    module = _load_helper()
+    external = tmp_path / "external"
+    external.mkdir()
+    configured = tmp_path / "configured"
+    configured.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        module.prepare_root(str(configured), str(configured))
+
+    assert list(external.iterdir()) == []
+
+
+def test_prepare_root_creates_missing_components_by_descriptor(tmp_path: Path) -> None:
+    module = _load_helper()
+    configured = tmp_path / "missing" / "hermes"
+
+    prepared = module.prepare_root(str(configured), str(configured))
+
+    assert prepared == configured
+    assert configured.is_dir()
 
 
 def _record_chown(monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> list[tuple[object, int | None, bool]]:
@@ -240,6 +265,30 @@ def test_repair_tree_warm_tree_executes_no_chown(
     )
 
     assert calls == []
+
+
+def test_repair_tree_uses_in_process_descriptor_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_helper()
+    target = tmp_path / "home"
+    target.mkdir()
+    (target / "state").write_text("repair")
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("ownership traversal must not spawn or shell out per entry")
+
+    monkeypatch.setattr(os, "system", forbidden)
+    monkeypatch.setattr(os, "fwalk", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+
+    module.repair_tree(
+        target,
+        os.getuid(),
+        os.getgid(),
+        mountinfo_path=_mountinfo(tmp_path / "mountinfo", target),
+    )
 
 
 def test_repair_tree_rejects_malformed_mountinfo_before_chown(

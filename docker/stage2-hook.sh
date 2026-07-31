@@ -81,14 +81,14 @@ fi
 # ancestors. Without this, the supported custom
 # `HERMES_HOME=/home/hermes/.hermes` path can fail on first boot when its
 # root-owned parent has not yet been populated by the image, with
-# `mkdir: cannot create directory '/...': Permission denied`. Idempotent — `mkdir -p`
-# is a no-op if the dir already exists. (#18482, salvages #18488)
+# `mkdir: cannot create directory '/...': Permission denied`. The helper uses
+# descriptor-relative mkdir/open operations so an existing or raced symlink
+# cannot redirect root bootstrap writes. (#18482, salvages #18488)
 if ! "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/docker/chown_hermes_tree.py" \
-    --validate-root "$HERMES_HOME" --safe-roots "$HERMES_WRITE_SAFE_ROOT"; then
+    --prepare-root "$HERMES_HOME" --safe-roots "$HERMES_WRITE_SAFE_ROOT"; then
     echo "[stage2] ERROR: refusing unsafe HERMES_HOME ownership authority: $HERMES_HOME" >&2
     exit 1
 fi
-mkdir -p "$HERMES_HOME"
 
 # Numeric UID/GID validation: must be digits only, non-root, 1-65534.
 # NAS hosts such as Unraid commonly use low non-root IDs (99:100).
