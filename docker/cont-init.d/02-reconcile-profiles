@@ -26,8 +26,10 @@ set -e
 
 STAGE2_STATUS_MARKER=/run/hermes-stage2-status
 SUPERVISE_STATUS_MARKER=/run/hermes-supervise-perms-status
-if [ "$(cat "$STAGE2_STATUS_MARKER" 2>/dev/null || true)" != ready ] || \
-        [ "$(cat "$SUPERVISE_STATUS_MARKER" 2>/dev/null || true)" != ready ]; then
+. /opt/hermes/docker/init_status.sh
+BOOT_TOKEN=$(hermes_current_boot_token)
+if ! hermes_status_is_ready "$STAGE2_STATUS_MARKER" "$BOOT_TOKEN" || \
+        ! hermes_status_is_ready "$SUPERVISE_STATUS_MARKER" "$BOOT_TOKEN"; then
     echo "[reconcile] prerequisite init failed; refusing persistent-state reconciliation" >&2
     exit 1
 fi

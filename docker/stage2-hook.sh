@@ -18,7 +18,9 @@
 set -eu
 
 STAGE2_STATUS_MARKER=/run/hermes-stage2-status
-if ! printf 'failed\n' > "$STAGE2_STATUS_MARKER"; then
+. /opt/hermes/docker/init_status.sh
+if ! BOOT_TOKEN=$(hermes_current_boot_token) || \
+        ! hermes_mark_status "$STAGE2_STATUS_MARKER" failed "$BOOT_TOKEN"; then
     echo "[stage2] ERROR: cannot establish fail-closed startup marker" >&2
     kill -TERM 1
     exit 1
@@ -603,8 +605,5 @@ if [ -z "${AGENT_BROWSER_EXECUTABLE_PATH:-}" ] && \
 fi
 
 echo "[stage2] Setup complete; starting user services"
-stage2_ready_tmp="${STAGE2_STATUS_MARKER}.ready.$$"
-printf 'ready\n' > "$stage2_ready_tmp"
-chmod 0600 "$stage2_ready_tmp"
-mv -f "$stage2_ready_tmp" "$STAGE2_STATUS_MARKER"
+hermes_mark_status "$STAGE2_STATUS_MARKER" ready "$BOOT_TOKEN"
 exit 0
