@@ -191,9 +191,9 @@ def validate_root_policy(value: str, safe_roots: str) -> Path:
 
 
 def _runtime_can_replace_child(metadata: os.stat_result, runtime_uid: int) -> bool:
-    mode = metadata.st_mode
+    mode = stat.S_IMODE(metadata.st_mode)
     return bool(
-        (metadata.st_uid == runtime_uid and mode & stat.S_IWUSR)
+        metadata.st_uid == runtime_uid
         or mode & stat.S_IWGRP
         or mode & stat.S_IWOTH
     )

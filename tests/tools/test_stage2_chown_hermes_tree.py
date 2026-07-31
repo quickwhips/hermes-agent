@@ -161,6 +161,26 @@ def test_prepare_root_rejects_runtime_writable_parent_before_creation(tmp_path: 
     assert not configured.exists()
 
 
+def test_parent_admission_rejects_runtime_owner_without_current_write_bits(
+    tmp_path: Path,
+) -> None:
+    module = _load_helper()
+    parent = tmp_path / "runtime-owned"
+    parent.mkdir(mode=0o555)
+    descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+
+    try:
+        with pytest.raises(OSError, match="runtime-writable parent"):
+            module._assert_stable_parent(
+                descriptor,
+                os.getuid(),
+                parent / "hermes",
+            )
+    finally:
+        os.close(descriptor)
+        parent.chmod(0o755)
+
+
 def test_prepare_root_allows_exact_mountpoint_with_writable_parent(tmp_path: Path) -> None:
     module = _load_helper()
     configured = tmp_path / "mounted"
