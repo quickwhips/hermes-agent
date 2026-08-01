@@ -1111,7 +1111,31 @@ class SessionSearchMixin:
         (#38763). Pass ``include_inactive=True`` to search every row regardless.
         """
         if not self._fts_enabled:
-            return []
+            # Older stores predate FTS and sometimes the active/tool columns.
+            # A bounded LIKE scan preserves read availability without creating
+            # indexes or attempting a runtime rebuild on a read-only handle.
+            if not self._legacy_read_compat or not query or not query.strip():
+                return []
+            needle = query.replace("*", "").replace('"', "").strip()
+            if not needle:
+                return []
+            escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where, params = ["m.content LIKE ? ESCAPE '\\'"], [f"%{escaped}%"]
+            if source_filter and self._has_column("sessions", "source"):
+                where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+                params.extend(source_filter)
+            if exclude_sources and self._has_column("sessions", "source"):
+                where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+                params.extend(exclude_sources)
+            if role_filter:
+                where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+                params.extend(role_filter)
+            sql = ("SELECT m.id, m.session_id, m.role, m.content AS snippet, m.content, "
+                   "m.timestamp, s.source, s.model, s.started_at AS session_started "
+                   "FROM messages m JOIN sessions s ON s.id=m.session_id WHERE "
+                   + " AND ".join(where) + " ORDER BY m.timestamp DESC LIMIT ? OFFSET ?")
+            with self._read_ctx() as conn:
+                return [dict(row) for row in conn.execute(sql, [*params, limit, offset]).fetchall()]
 
         if not query or not query.strip():
             return []

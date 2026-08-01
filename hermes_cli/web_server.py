@@ -13899,6 +13899,8 @@ def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
 
     db = _open_session_db_for_profile(profile, read_only=True)
     try:
+        if getattr(db, "_legacy_read_compat", False):
+            return _empty_usage_analytics(days)
         cutoff = time.time() - (days * 86400)
         cur = db._conn.execute("""
             SELECT date(started_at, 'unixepoch') as day,
@@ -14009,6 +14011,8 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
 
     db = _open_session_db_for_profile(profile, read_only=True)
     try:
+        if getattr(db, "_legacy_read_compat", False):
+            return _empty_models_analytics(days)
         cutoff = time.time() - (days * 86400)
 
         cur = db._conn.execute("""
