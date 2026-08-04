@@ -3254,6 +3254,10 @@ async def get_status(profile: Optional[str] = None):
                 "state": gateway_state or ("running" if gateway_running else "stopped"),
             },
             "dashboard": DASHBOARD_HEALTH.snapshot(),
+            # PTY status is intentionally only bounded aggregate lifecycle
+            # counters. Attach tokens, commands, paths, and child output never
+            # cross this public status boundary.
+            "pty": PTY_REGISTRY.snapshot(),
         }
         try:
             from gateway.readiness import _probe_state_db
@@ -15745,19 +15749,35 @@ async def pty_ws(ws: WebSocket) -> None:
 
     # Keep-alive path: the PTY outlives this socket; reattach by token.
     try:
-        session, _created = await PTY_REGISTRY.attach_or_spawn(
-            attach_token, spawn=_spawn
-        )
+        if force_fresh:
+            session, _created = await PTY_REGISTRY.rotate(
+                attach_token, spawn=_spawn
+            )
+        else:
+            session, _created = await PTY_REGISTRY.attach_or_spawn(
+                attach_token, spawn=_spawn
+            )
     except PtyUnavailableError as exc:
+        PTY_REGISTRY.record_ws_failure("pty_unavailable")
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
         return
     except (FileNotFoundError, OSError, RegistryFull) as exc:
+        PTY_REGISTRY.record_ws_failure(
+            "registry_full" if isinstance(exc, RegistryFull) else "spawn_failed"
+        )
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
         return
 
-    await session.attach(ws)
+    try:
+        await session.attach(ws)
+    except RuntimeError:
+        # A concurrent ``fresh=1`` rotation can retire the looked-up session
+        # before this handler attaches. Treat that as an intentional
+        # supersession, not an unhandled server error or a stale PTY write.
+        await ws.close(code=4409)
+        return
 
     # --- writer loop: WebSocket → PTY master ----------------------------
     # No reader task here: the session's drain task (spawned once per PTY,
