@@ -2,6 +2,7 @@
 
 import json
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -168,9 +169,92 @@ def test_child_eof_closes_socket_and_bridge(pty_client, monkeypatch):
     # bridge.close() runs in the handler's `finally` via asyncio.to_thread,
     # which can lag the client-side context exit by a tick or two. Poll briefly
     # instead of asserting immediately so the teardown isn't a race.
-    import time
-
     deadline = time.monotonic() + 5.0
     while not bridges[0].closed and time.monotonic() < deadline:
         time.sleep(0.01)
     assert bridges[0].closed is True
+
+
+def test_fresh_param_rotates_keepalive_attach_identity(
+    pty_client, monkeypatch
+):
+    """Explicit fresh on an attach token must call the rotate path."""
+    ws, client, token = pty_client
+    calls = {"rotate": 0, "attach_or_spawn": 0}
+
+    class _FakeSession:
+        def __init__(self):
+            self.bridge = object()
+
+        async def attach(self, ws_conn):
+            await ws_conn.send_bytes(b"ready")
+
+    async def fake_rotate(key, *, spawn):
+        calls["rotate"] += 1
+        return _FakeSession(), True
+
+    async def fail_attach_or_spawn(*args, **kwargs):
+        calls["attach_or_spawn"] += 1
+        raise AssertionError("fresh reconnect must use PTY_REGISTRY.rotate")
+
+    async def fake_resolve(resume=None, sidecar_url=None, profile=None, active_session_file=None):
+        return (["fake-hermes-tui"], None, None)
+
+    monkeypatch.setattr(ws.PTY_REGISTRY, "rotate", fake_rotate)
+    monkeypatch.setattr(ws.PTY_REGISTRY, "attach_or_spawn", fail_attach_or_spawn)
+    monkeypatch.setattr(ws, "_resolve_chat_argv_async", fake_resolve)
+
+    with client.websocket_connect(_url(token, attach="ROTATE-TOKEN", fresh="1")) as conn:
+        assert conn.receive_bytes() == b"ready"
+
+    assert calls["rotate"] == 1
+    assert calls["attach_or_spawn"] == 0
+
+
+def test_status_exposes_secret_safe_pty_component(
+    pty_client, monkeypatch
+):
+    """/api/status should expose PTY telemetry without leaking attach tokens."""
+    ws, client, token = pty_client
+
+    class _IdleBridge:
+        def __init__(self):
+            self.closed = False
+            self._sent = False
+
+        def read(self, timeout):
+            if not self._sent:
+                self._sent = True
+                return b"ready"
+            return b""
+
+        def resize(self, *, cols, rows):
+            pass
+
+        def write(self, raw):
+            pass
+
+        def close(self):
+            self.closed = True
+
+        @classmethod
+        def spawn(cls, *args, **kwargs):
+            return cls()
+
+    async def fake_resolve(resume=None, sidecar_url=None, profile=None, active_session_file=None):
+        return (["fake-hermes-tui"], None, None)
+
+    monkeypatch.setattr(ws.PtyBridge, "spawn", _IdleBridge.spawn)
+    monkeypatch.setattr(ws, "_resolve_chat_argv_async", fake_resolve)
+
+    with client.websocket_connect(_url(token, attach="STATUS-SECRET")) as conn:
+        assert conn.receive_bytes() == b"ready"
+
+    payload = client.get("/api/status").json()
+    pty = payload["components"].get("pty")
+
+    assert pty is not None
+    assert pty["status"] == "ok"
+    assert pty["sessions"]["total"] == 1
+    assert pty["events"]["create"] >= 1
+    assert "STATUS-SECRET" not in repr(pty)

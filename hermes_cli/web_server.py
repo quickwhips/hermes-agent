@@ -3339,6 +3339,7 @@ async def get_status(profile: Optional[str] = None):
                 "state": gateway_state or ("running" if gateway_running else "stopped"),
             },
             "dashboard": DASHBOARD_HEALTH.snapshot(),
+            "pty": PTY_REGISTRY.snapshot(),
         }
         try:
             from gateway.readiness import _probe_state_db
@@ -18576,15 +18577,21 @@ async def pty_ws(ws: WebSocket) -> None:
 
     # Keep-alive path: the PTY outlives this socket; reattach by token.
     try:
-        session, _created = await PTY_REGISTRY.attach_or_spawn(
-            attach_token, spawn=_spawn
-        )
+        if force_fresh:
+            session, _created = await PTY_REGISTRY.rotate(attach_token, spawn=_spawn)
+        else:
+            session, _created = await PTY_REGISTRY.attach_or_spawn(
+                attach_token, spawn=_spawn
+            )
     except PtyUnavailableError as exc:
-        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
+        PTY_REGISTRY.record_ws_failure("pty_unavailable")
+        await ws.send_text(f"\r\n\x1b[31mChat unavailable: PTY unavailable\x1b[0m\r\n")
         await ws.close(code=1011)
         return
     except (FileNotFoundError, OSError, RegistryFull) as exc:
-        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
+        outcome = "registry_full" if isinstance(exc, RegistryFull) else "spawn_failed"
+        PTY_REGISTRY.record_ws_failure(outcome)
+        await ws.send_text(f"\r\n\x1b[31mChat unavailable: PTY start failed\x1b[0m\r\n")
         await ws.close(code=1011)
         return
 
